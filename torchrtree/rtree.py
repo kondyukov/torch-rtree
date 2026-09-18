@@ -1,168 +1,252 @@
 """
 R-Tree in pure PyTorch.
 
-Construction packs leaves sorted along a space-filling curve (Morton or
-Hilbert) into a flat, uniform-depth tree. Queries run level-synchronously: a
+Construction packs leaves sorted along a space-filling curve (Hilbert or
+Morton) into a flat, uniform-depth tree. Queries run level-synchronously: a
 flat frontier of (query, node) pairs is tested and expanded once per level, so
 the number of tensor-op batches is the tree depth, not the traversal length.
 
 The tree is static. Rebuilding is cheap (about 10 ms per million boxes on a
 GPU), so the update path is "rebuild".
-
-Supported: ndim in {2, 3, 4} (2D, 3D, 3D+time); float32 and float64.
 """
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
 
-SUPPORTED_NDIMS = (2, 3, 4)
-SUPPORTED_DTYPES = (torch.float32, torch.float64)
+from ._curves import CURVES, Curve, sfc_codes
 
-Curve = Literal["morton", "hilbert"]
+SUPPORTED_NDIMS: tuple[int, ...] = tuple(range(1, 9))
+SUPPORTED_DTYPES: tuple[torch.dtype, ...] = (torch.float32, torch.float64)
+
 QueryMode = Literal["intersects", "contains", "within"]
-_MODES = ("intersects", "contains", "within")
+_MODES: tuple[str, ...] = ("intersects", "contains", "within")
+_STATE_FORMAT = 2
 
 
 # -----------------------------------------------------------------------------
-# Validation
+# Input conversion and validation
 # -----------------------------------------------------------------------------
 
-def _validate_boxes(
-    mins: Tensor,
-    maxs: Tensor,
-    *,
-    name: str,
-    ndim: int | None = None,
-    device: torch.device | None = None,
-) -> None:
-    if not (isinstance(mins, Tensor) and isinstance(maxs, Tensor)):
-        raise TypeError(f"{name}: expected tensors, got {type(mins)} / {type(maxs)}")
-    if mins.dim() != 2:
-        raise ValueError(f"{name}: expected shape (N, ndim), got {tuple(mins.shape)}")
-    if mins.shape != maxs.shape:
-        raise ValueError(f"{name}: mins {tuple(mins.shape)} and maxs {tuple(maxs.shape)} differ")
-    if mins.dtype != maxs.dtype:
-        raise TypeError(f"{name}: mins dtype {mins.dtype} != maxs dtype {maxs.dtype}")
-    if mins.dtype not in SUPPORTED_DTYPES:
-        raise TypeError(f"{name}: dtype must be one of {SUPPORTED_DTYPES}, got {mins.dtype}")
-    if mins.device != maxs.device:
-        raise ValueError(f"{name}: mins on {mins.device} but maxs on {maxs.device}")
-    if device is not None and mins.device != device:
-        raise ValueError(f"{name}: expected tensors on {device}, got {mins.device}")
-    d = mins.shape[1]
+def _as_coords(x: Any, name: str) -> Tensor:
+    """Accept tensors, numpy arrays and nested lists; map to a supported float dtype."""
+    t = x if isinstance(x, Tensor) else torch.as_tensor(x)
+    if t.dtype in SUPPORTED_DTYPES:
+        return t
+    if t.dtype in (torch.float16, torch.bfloat16):
+        return t.to(torch.float32)
+    if not t.dtype.is_floating_point and not t.dtype.is_complex and t.dtype != torch.bool:
+        return t.to(torch.float64)  # integers: exact up to 2^53
+    raise TypeError(f"{name}: unsupported dtype {t.dtype}; use float32, float64 or an integer type")
+
+
+def _as_boxes(mins: Any, maxs: Any | None, name: str, ndim: int | None = None) -> tuple[Tensor, Tensor]:
+    """Normalise (mins, maxs) or points (maxs=None) to two same-shaped float tensors."""
+    lo = _as_coords(mins, name)
+    hi = lo if maxs is None else _as_coords(maxs, name)
+    if lo.dim() == 1 and ndim is not None and lo.shape[0] == ndim:
+        lo, hi = lo.unsqueeze(0), hi.unsqueeze(0)  # a single box / point
+    if lo.dim() != 2:
+        raise ValueError(f"{name}: expected shape (N, ndim), got {tuple(lo.shape)}")
+    if lo.shape != hi.shape:
+        raise ValueError(f"{name}: mins {tuple(lo.shape)} and maxs {tuple(hi.shape)} differ")
+    if lo.device != hi.device:
+        raise ValueError(f"{name}: mins on {lo.device} but maxs on {hi.device}")
+    if lo.dtype != hi.dtype:
+        dt = torch.promote_types(lo.dtype, hi.dtype)
+        lo, hi = lo.to(dt), hi.to(dt)
+    d = lo.shape[1]
     if ndim is not None and d != ndim:
         raise ValueError(f"{name}: expected ndim={ndim}, got {d}")
     if d not in SUPPORTED_NDIMS:
-        raise NotImplementedError(f"{name}: ndim must be one of {SUPPORTED_NDIMS}, got {d}")
-    if mins.numel():
-        if not (torch.isfinite(mins).all() and torch.isfinite(maxs).all()):
-            raise ValueError(f"{name}: coordinates must be finite (no NaN / inf)")
-        if not (mins <= maxs).all():
-            raise ValueError(f"{name}: every min must be <= the corresponding max")
+        raise ValueError(f"{name}: ndim must be in {SUPPORTED_NDIMS[0]}..{SUPPORTED_NDIMS[-1]}, got {d}")
+    return lo, hi
+
+
+def _check_values(lo: Tensor, hi: Tensor, name: str, allow_inf: bool) -> None:
+    """Value checks (each is a host sync); skipped when a caller passes validate=False."""
+    if lo.numel() == 0:
+        return
+    if allow_inf:
+        if torch.isnan(lo).any() or torch.isnan(hi).any():
+            raise ValueError(f"{name}: coordinates must not be NaN")
+    elif not (torch.isfinite(lo).all() and torch.isfinite(hi).all()):
+        raise ValueError(f"{name}: coordinates must be finite (no NaN / inf)")
+    if not (lo <= hi).all():
+        raise ValueError(f"{name}: every min must be <= the corresponding max")
 
 
 # -----------------------------------------------------------------------------
-# Space-filling curves
+# Query result
 # -----------------------------------------------------------------------------
 
-def _sfc_bits(ndim: int) -> int:
-    """Bits per axis so that ndim * bits <= 63 (key fits a signed int64)."""
-    return 63 // ndim
-
-
-def _quantize(centers: Tensor, g_min: Tensor, g_range: Tensor, bits: int) -> Tensor:
-    """Per-axis normalise to [0, 2^bits - 1] and truncate to int64."""
-    max_q = (1 << bits) - 1
-    norm = ((centers - g_min) / g_range).to(torch.float64) * max_q
-    return norm.to(torch.int64).clamp_(0, max_q)
-
-
-def _interleave_bits(q: Tensor, bits: int, axis0_msb: bool) -> Tensor:
+class QueryResult:
     """
-    Interleave the low `bits` bits of each column of an (N, ndim) int64 tensor.
-    Bit b of axis d lands at b * ndim + slot(d), where slot(d) is d (axis 0
-    least significant, the Morton convention matching the CUDA reference) or
-    ndim - 1 - d (axis 0 most significant, the Hilbert transpose convention).
+    Ragged result of a box query: P (query, box) pairs grouped by ascending
+    query index, plus per-query counts and CSR-style offsets.
+
+    Unpacks as a pair: ``query_idx, box_idx = tree.search(...)``.
+    ``result[q]`` gives the box indices for query q; ``to_padded()`` gives a
+    dense (Q, max_results) tensor padded with -1.
     """
-    ndim = q.shape[-1]
-    code = torch.zeros(q.shape[0], dtype=torch.int64, device=q.device)
-    for b in range(bits):
-        for d in range(ndim):
-            slot = (ndim - 1 - d) if axis0_msb else d
-            code |= ((q[:, d] >> b) & 1) << (b * ndim + slot)
-    return code
 
+    __slots__ = ("query_idx", "box_idx", "counts", "offsets")
 
-def _morton_codes(q: Tensor, bits: int) -> Tensor:
-    return _interleave_bits(q, bits, axis0_msb=False)
+    def __init__(self, query_idx: Tensor, box_idx: Tensor, counts: Tensor):
+        self.query_idx = query_idx
+        self.box_idx = box_idx
+        self.counts = counts
+        self.offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
 
+    @property
+    def num_queries(self) -> int:
+        return self.counts.numel()
 
-def _hilbert_transpose(q: Tensor, bits: int) -> Tensor:
-    """
-    Axes -> transposed Hilbert coordinates (Skilling, "Programming the Hilbert
-    curve", 2004), vectorised over rows. Input/output are (N, ndim) int64.
-    """
-    n = q.shape[1]
-    X = [q[:, i].clone() for i in range(n)]
-    M = 1 << (bits - 1)
-    Q = M
-    while Q > 1:  # inverse undo
-        P = Q - 1
-        for i in range(n):
-            flag = (X[i] & Q) != 0
-            # flag: invert X[0] by P. else: exchange the P bits of X[0] and X[i].
-            t = torch.where(flag, torch.full_like(X[0], P), (X[0] ^ X[i]) & P)
-            X[0] = X[0] ^ t
-            if i > 0:
-                X[i] = torch.where(flag, X[i], X[i] ^ t)
-        Q >>= 1
-    for i in range(1, n):  # gray encode
-        X[i] = X[i] ^ X[i - 1]
-    t = torch.zeros_like(X[0])
-    Q = M
-    while Q > 1:
-        t = torch.where((X[n - 1] & Q) != 0, t ^ (Q - 1), t)
-        Q >>= 1
-    return torch.stack([x ^ t for x in X], dim=1)
+    @property
+    def device(self) -> torch.device:
+        return self.box_idx.device
 
+    def __len__(self) -> int:
+        return self.box_idx.numel()
 
-def _hilbert_codes(q: Tensor, bits: int) -> Tensor:
-    return _interleave_bits(_hilbert_transpose(q, bits), bits, axis0_msb=True)
+    def __iter__(self):
+        return iter((self.query_idx, self.box_idx))
 
+    def __getitem__(self, q: int) -> Tensor:
+        if not -self.num_queries <= q < self.num_queries:
+            raise IndexError(f"query index {q} out of range for {self.num_queries} queries")
+        q = q % self.num_queries
+        s, e = self.offsets[q].item(), self.offsets[q + 1].item()
+        return self.box_idx[s:e]
 
-def _sfc_codes(centers: Tensor, g_min: Tensor, g_range: Tensor, curve: Curve = "hilbert") -> Tensor:
-    """Map (N, ndim) centers to a 1-D sortable int64 key along the chosen curve."""
-    ndim = centers.shape[-1]
-    bits = _sfc_bits(ndim)
-    q = _quantize(centers, g_min, g_range, bits)
-    if curve == "morton":
-        return _morton_codes(q, bits)
-    if curve == "hilbert":
-        return _hilbert_codes(q, bits)
-    raise ValueError(f"curve must be 'morton' or 'hilbert', got {curve!r}")
+    def to_padded(self, max_results: int = -1, fill: int = -1) -> Tensor:
+        """(Q, max_results) int64; -1 (default) sizes to the widest query. Extra hits are dropped."""
+        Q = self.num_queries
+        if max_results <= 0:
+            max_results = int(self.counts.max().item()) if Q > 0 else 0
+        max_results = max(max_results, 1)
+        pos = torch.arange(len(self), device=self.device) - self.offsets[self.query_idx]
+        keep = pos < max_results
+        out = torch.full((Q, max_results), fill, dtype=torch.int64, device=self.device)
+        out[self.query_idx[keep], pos[keep]] = self.box_idx[keep]
+        return out
+
+    def to_list(self) -> list[list[int]]:
+        """Per-query Python lists (moves to host)."""
+        boxes, offs = self.box_idx.tolist(), self.offsets.tolist()
+        return [boxes[offs[i]:offs[i + 1]] for i in range(self.num_queries)]
+
+    def to(self, device) -> QueryResult:
+        return QueryResult(self.query_idx.to(device), self.box_idx.to(device), self.counts.to(device))
+
+    def __repr__(self) -> str:
+        return f"QueryResult(num_queries={self.num_queries}, num_pairs={len(self)}, device={self.device})"
 
 
 # -----------------------------------------------------------------------------
-# Tree container
+# Tree
 # -----------------------------------------------------------------------------
 
-class RTree(NamedTuple):
-    mins: Tensor              # (total_nodes, ndim)
-    maxs: Tensor              # (total_nodes, ndim)
-    start_indices: Tensor     # (total_nodes,) child range start (internal nodes only)
-    end_indices: Tensor       # (total_nodes,) child range end (inclusive)
-    level_starts: Tensor      # (num_levels + 1,) cumulative level offsets
-    leaf_order: Tensor        # (num_leaves,) original index of each sorted leaf
-    leaf_start: int           # index of first leaf in flat layout
-    num_leaves: int
-    m: int                    # max children per internal node
-    ndim: int
+class RTree:
+    """
+    Packed, static R-tree over N axis-aligned boxes.
 
-    # -- introspection -------------------------------------------------------
+    RTree(mins, maxs)          index boxes given by (N, ndim) lower / upper corners
+    RTree(points)              index points (zero-size boxes)
+    RTree.from_bounds(b)       index boxes given as (N, 2 * ndim) [mins..., maxs...]
+
+    Inputs may be tensors, numpy arrays or lists; integer coordinates are cast
+    to float64. Everything is stored detached on the input device.
+    """
+
+    __slots__ = ("mins", "maxs", "leaf_order", "level_starts", "level_fanout",
+                 "fanout", "curve", "ndim", "num_boxes", "leaf_start")
+
+    def __init__(self, mins: Any, maxs: Any | None = None, *, fanout: int = 8, curve: Curve = "hilbert"):
+        if fanout < 2:
+            raise ValueError(f"fanout must be >= 2, got {fanout}")
+        if curve not in CURVES:
+            raise ValueError(f"curve must be one of {CURVES}, got {curve!r}")
+        lo, hi = _as_boxes(mins, maxs, "RTree")
+        _check_values(lo, hi, "RTree", allow_inf=False)
+        with torch.no_grad():
+            self._build(lo.detach(), hi.detach(), fanout, curve)
+
+    # -- construction -----------------------------------------------------------
+    def _build(self, mins: Tensor, maxs: Tensor, fanout: int, curve: str) -> None:
+        n, ndim = mins.shape
+        device, dtype = mins.device, mins.dtype
+
+        # 1. Sort leaves by curve key of their centres (stable: reproducible across devices).
+        if n > 0:
+            centers = (mins + maxs) * 0.5
+            g_min = mins.amin(dim=0)
+            g_range = (maxs.amax(dim=0) - g_min).clamp_min(torch.finfo(dtype).tiny)
+            order = torch.argsort(sfc_codes(centers, g_min, g_range, curve), stable=True)
+        else:
+            order = torch.empty(0, dtype=torch.int64, device=device)
+
+        # 2. Level sizes, top-down (level 0 = root, last = leaves).
+        sizes_bu = [n]
+        while sizes_bu[-1] > 1:
+            sizes_bu.append((sizes_bu[-1] + fanout - 1) // fanout)
+        level_sizes = sizes_bu[::-1]
+        level_starts = [0]
+        for s in level_sizes:
+            level_starts.append(level_starts[-1] + s)
+        total = level_starts[-1]
+        leaf_start = level_starts[-2]
+
+        # 3. Flat node tensors; leaves at the bottom.
+        tree_mins = torch.empty((total, ndim), dtype=dtype, device=device)
+        tree_maxs = torch.empty((total, ndim), dtype=dtype, device=device)
+        tree_mins[leaf_start:] = mins[order]
+        tree_maxs[leaf_start:] = maxs[order]
+
+        # 4. Internal levels bottom-up. Node i of a level owns children
+        #    [i * cpn, i * cpn + cpn) of the level below (last node may be short),
+        #    so child ranges are arithmetic and never stored.
+        level_fanout = []
+        inf = torch.tensor(float("inf"), dtype=dtype, device=device)
+        for level in range(len(level_sizes) - 2, -1, -1):
+            ls, sz = level_starts[level], level_sizes[level]
+            cls_, csz = level_starts[level + 1], level_sizes[level + 1]
+            cpn = min(-(-csz // sz), fanout)
+            level_fanout.append(cpn)
+            c_mins, c_maxs = tree_mins[cls_:cls_ + csz], tree_maxs[cls_:cls_ + csz]
+            pad = sz * cpn - csz
+            if pad > 0:  # +inf / -inf are identities under amin / amax
+                c_mins = torch.cat([c_mins, inf.expand(pad, ndim)])
+                c_maxs = torch.cat([c_maxs, (-inf).expand(pad, ndim)])
+            tree_mins[ls:ls + sz] = c_mins.view(sz, cpn, ndim).amin(dim=1)
+            tree_maxs[ls:ls + sz] = c_maxs.view(sz, cpn, ndim).amax(dim=1)
+
+        self.mins, self.maxs, self.leaf_order = tree_mins, tree_maxs, order
+        self.level_starts = tuple(level_starts)
+        self.level_fanout = tuple(reversed(level_fanout))  # indexed by internal level, top-down
+        self.fanout, self.curve, self.ndim = fanout, curve, ndim
+        self.num_boxes, self.leaf_start = n, leaf_start
+
+    @classmethod
+    def from_bounds(cls, bounds: Any, **kw) -> RTree:
+        """Build from an (N, 2 * ndim) tensor laid out as [min_0..min_d, max_0..max_d]."""
+        b = _as_coords(bounds, "from_bounds")
+        if b.dim() != 2 or b.shape[1] % 2:
+            raise ValueError(f"from_bounds: expected shape (N, 2 * ndim), got {tuple(b.shape)}")
+        d = b.shape[1] // 2
+        return cls(b[:, :d], b[:, d:], **kw)
+
+    @classmethod
+    def _from_parts(cls, **parts) -> RTree:
+        self = cls.__new__(cls)
+        for k in cls.__slots__:
+            setattr(self, k, parts[k])
+        return self
+
+    # -- introspection -------------------------------------------------------------
     @property
     def device(self) -> torch.device:
         return self.mins.device
@@ -173,31 +257,62 @@ class RTree(NamedTuple):
 
     @property
     def num_levels(self) -> int:
-        return self.level_starts.numel() - 1
+        return len(self.level_starts) - 1
 
     @property
     def num_nodes(self) -> int:
         return self.mins.shape[0]
 
-    # -- device / persistence ---------------------------------------------------
+    @property
+    def bounds(self) -> tuple[Tensor, Tensor] | None:
+        """(mins, maxs) of the root box, or None for an empty tree."""
+        return (self.mins[0], self.maxs[0]) if self.num_boxes else None
+
+    def boxes(self) -> tuple[Tensor, Tensor]:
+        """The indexed boxes in their original input order."""
+        lo = torch.empty_like(self.mins[self.leaf_start:])
+        hi = torch.empty_like(lo)
+        lo[self.leaf_order] = self.mins[self.leaf_start:]
+        hi[self.leaf_order] = self.maxs[self.leaf_start:]
+        return lo, hi
+
+    def __len__(self) -> int:
+        return self.num_boxes
+
+    def __repr__(self) -> str:
+        return (f"RTree(num_boxes={self.num_boxes}, ndim={self.ndim}, fanout={self.fanout}, "
+                f"curve={self.curve!r}, levels={self.num_levels}, dtype={self.dtype}, device={self.device})")
+
+    # -- device / persistence -----------------------------------------------------
     def to(self, device) -> RTree:
         device = torch.device(device)
-        if device == self.device:
+        same_index = device.index is None or device.index == self.device.index
+        if device.type == self.device.type and same_index:
             return self
-        return self._replace(
-            mins=self.mins.to(device), maxs=self.maxs.to(device),
-            start_indices=self.start_indices.to(device), end_indices=self.end_indices.to(device),
-            level_starts=self.level_starts.to(device), leaf_order=self.leaf_order.to(device),
-        )
+        parts = {k: getattr(self, k) for k in self.__slots__}
+        for k in ("mins", "maxs", "leaf_order"):
+            parts[k] = parts[k].to(device)
+        return RTree._from_parts(**parts)
+
+    def cpu(self) -> RTree:
+        return self.to("cpu")
+
+    def cuda(self, device=None) -> RTree:
+        return self.to("cuda" if device is None else device)
 
     def state_dict(self) -> dict:
-        return {"format": 1, **self._asdict()}
+        d = {k: getattr(self, k) for k in self.__slots__}
+        d["level_starts"], d["level_fanout"] = list(d["level_starts"]), list(d["level_fanout"])
+        return {"format": _STATE_FORMAT, **d}
 
     @classmethod
     def from_state_dict(cls, state: dict) -> RTree:
-        if state.get("format") != 1:
+        if state.get("format") != _STATE_FORMAT:
             raise ValueError(f"unknown RTree state format {state.get('format')!r}")
-        return cls(**{k: state[k] for k in cls._fields})
+        parts = {k: state[k] for k in cls.__slots__}
+        parts["level_starts"] = tuple(parts["level_starts"])
+        parts["level_fanout"] = tuple(parts["level_fanout"])
+        return cls._from_parts(**parts)
 
     def save(self, path) -> None:
         torch.save(self.state_dict(), path)
@@ -206,108 +321,211 @@ class RTree(NamedTuple):
     def load(cls, path, map_location=None) -> RTree:
         return cls.from_state_dict(torch.load(path, map_location=map_location))
 
-    # -- queries (thin wrappers over the module functions) ------------------------
-    def query(self, query_mins, query_maxs, max_results=-1, mode: QueryMode = "intersects", **kw):
-        return query_rtree(self, query_mins, query_maxs, max_results, mode, **kw)
+    # -- queries ----------------------------------------------------------------------
+    def _queries(self, qmins: Any, qmaxs: Any | None, name: str,
+                 validate: bool) -> tuple[Tensor, Tensor]:
+        lo, hi = _as_boxes(qmins, qmaxs, name, ndim=self.ndim)
+        if validate:
+            _check_values(lo, hi, name, allow_inf=True)
+        return lo.to(device=self.device, dtype=self.dtype), hi.to(device=self.device, dtype=self.dtype)
 
-    def query_pairs(self, query_mins, query_maxs, mode: QueryMode = "intersects", **kw):
-        return query_rtree_pairs(self, query_mins, query_maxs, mode, **kw)
+    def search(
+        self,
+        qmins: Any,
+        qmaxs: Any | None = None,
+        *,
+        mode: QueryMode = "intersects",
+        sort: bool = False,
+        chunk_size: int | None = None,
+        max_pairs: int | None = None,
+        validate: bool = True,
+    ) -> QueryResult:
+        """
+        Boxes matching each query box (or point, if `qmaxs` is omitted).
 
-    def query_points(self, points, **kw):
-        return query_rtree_points(self, points, **kw)
+        mode:        "intersects" (closed intervals; touching counts),
+                     "contains"   (indexed box lies entirely inside the query),
+                     "within"     (indexed box entirely contains the query).
+        sort:        sort box indices ascending within each query (default: tree order).
+        chunk_size:  process at most this many queries at once to bound memory.
+        max_pairs:   raise if any level's frontier exceeds this many pairs.
+        validate:    check for NaN and min <= max (each check is a device sync).
+        """
+        if mode not in _MODES:
+            raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
+        lo, hi = self._queries(qmins, qmaxs, "search", validate)
+        q_idx, node = _run_frontier(self, lo, hi, mode, chunk_size, max_pairs)
+        box = self.leaf_order[node - self.leaf_start]
+        if sort and q_idx.numel():
+            perm = torch.argsort(q_idx * max(self.num_boxes, 1) + box)
+            q_idx, box = q_idx[perm], box[perm]
+        return QueryResult(q_idx, box, torch.bincount(q_idx, minlength=lo.shape[0]))
 
-    def nearest(self, points, k: int = 1, **kw):
-        return query_rtree_nearest(self, points, k, **kw)
+    def count(
+        self,
+        qmins: Any,
+        qmaxs: Any | None = None,
+        *,
+        mode: QueryMode = "intersects",
+        chunk_size: int | None = None,
+        max_pairs: int | None = None,
+        validate: bool = True,
+    ) -> Tensor:
+        """Number of matching boxes per query, as a (Q,) int64 tensor."""
+        if mode not in _MODES:
+            raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
+        lo, hi = self._queries(qmins, qmaxs, "count", validate)
+        q_idx, _ = _run_frontier(self, lo, hi, mode, chunk_size, max_pairs)
+        return torch.bincount(q_idx, minlength=lo.shape[0])
+
+    def within_distance(
+        self,
+        qmins: Any,
+        qmaxs: Any | None = None,
+        *,
+        distance: float,
+        axis_scale: Any | None = None,
+        sort: bool = False,
+        chunk_size: int | None = None,
+        max_pairs: int | None = None,
+        validate: bool = True,
+    ) -> QueryResult:
+        """
+        Boxes whose Euclidean box-to-box distance from each query box (or point)
+        is <= `distance`. `axis_scale` (ndim,) multiplies per-axis gaps before
+        the norm, e.g. to weight a time axis against spatial axes.
+        """
+        if distance < 0:
+            raise ValueError(f"distance must be >= 0, got {distance}")
+        lo, hi = self._queries(qmins, qmaxs, "within_distance", validate)
+        scale = self._axis_scale(axis_scale)
+        rad = (distance / scale).unsqueeze(0)
+        q_idx, node = _run_frontier(self, _step_down(lo - rad), _step_up(hi + rad), "intersects",
+                                    chunk_size, max_pairs)
+        d = _box_distance(self, node, lo[q_idx], hi[q_idx], scale)
+        keep = d <= distance
+        q_idx, box = q_idx[keep], self.leaf_order[node[keep] - self.leaf_start]
+        if sort and q_idx.numel():
+            perm = torch.argsort(q_idx * max(self.num_boxes, 1) + box)
+            q_idx, box = q_idx[perm], box[perm]
+        return QueryResult(q_idx, box, torch.bincount(q_idx, minlength=lo.shape[0]))
+
+    def nearest(
+        self,
+        qmins: Any,
+        qmaxs: Any | None = None,
+        *,
+        k: int = 1,
+        max_distance: float | None = None,
+        axis_scale: Any | None = None,
+        chunk_size: int | None = None,
+        max_pairs: int | None = None,
+        validate: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        k nearest boxes to each query point (or box) by Euclidean box-to-box
+        distance, which is zero when they overlap. Returns (dist, idx), each
+        (Q, k), ascending; padded with +inf / -1 when fewer than k boxes exist
+        or lie within `max_distance`. `axis_scale` weights axes as in
+        `within_distance`.
+
+        Implemented as an expanding search: each query searches a cube of
+        radius r and is finished once it has >= k candidates whose k-th
+        distance is <= r (the cube contains the ball, so nothing closer was
+        missed). Queries with >= k candidates but a k-th distance beyond r
+        retry once at exactly that distance; others double r.
+        """
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        if max_distance is not None and max_distance < 0:
+            raise ValueError(f"max_distance must be >= 0, got {max_distance}")
+        lo_all, hi_all = self._queries(qmins, qmaxs, "nearest", validate)
+        Q, device, dtype = lo_all.shape[0], self.device, self.dtype
+        idx_out = torch.full((Q, k), -1, dtype=torch.int64, device=device)
+        dist_out = torch.full((Q, k), float("inf"), dtype=dtype, device=device)
+        if Q == 0 or self.num_boxes == 0:
+            return dist_out, idx_out
+        k_eff = min(k, self.num_boxes)
+        scale = self._axis_scale(axis_scale)
+
+        root_lo, root_hi = self.mins[0], self.maxs[0]
+        ranges = ((root_hi - root_lo) * scale).double()  # root extent in scaled units
+        extent = float(ranges.amax().item())
+        # Initial radius: half the side of the cube holding ~k boxes if they were
+        # uniform over the root VOLUME (not its widest axis, which misbehaves on
+        # anisotropic data such as a wide time axis).
+        volume = float(ranges.clamp_min(extent * 1e-3).prod().item()) if extent > 0 else 0.0
+        r0 = 0.5 * (k_eff / self.num_boxes * volume) ** (1.0 / self.ndim)
+        r0 = max(r0, extent * 1e-6, 1e-30)
+        # A cube of this radius covers the root box for every query, so the
+        # search is exhaustive: r >= lo - root_lo and r >= root_hi - hi per axis.
+        far = torch.maximum((lo_all - root_lo).abs(), (root_hi - hi_all).abs()) * scale
+        r_max = float(far.amax().item()) * 1.001 + 1.0
+        cap = r_max if max_distance is None else min(max_distance, r_max)
+
+        root_node = torch.zeros(Q, dtype=torch.int64, device=device)
+        r = (_box_distance(self, root_node, lo_all, hi_all, scale) * 1.001).clamp_min(r0).clamp_max(cap)
+        pending = torch.arange(Q, device=device)
+
+        while pending.numel() > 0:
+            lo, hi = lo_all[pending], hi_all[pending]
+            rad = (r[pending].unsqueeze(1) / scale)
+            q, node = _run_frontier(self, _step_down(lo - rad), _step_up(hi + rad), "intersects",
+                                    chunk_size, max_pairs)
+            d = _box_distance(self, node, lo[q], hi[q], scale)
+
+            # Order pairs by (query, distance): sort by distance, then stable sort by query.
+            d, perm = torch.sort(d)
+            q, node = q[perm], node[perm]
+            q, perm = torch.sort(q, stable=True)
+            d, node = d[perm], node[perm]
+
+            counts = torch.bincount(q, minlength=pending.numel())
+            pos = torch.arange(q.numel(), device=device) - (counts.cumsum(0) - counts)[q]
+            has_k = counts >= k_eff
+            kth = torch.full((pending.numel(),), float("inf"), dtype=dtype, device=device)
+            sel = pos == (k_eff - 1)
+            kth[q[sel]] = d[sel]
+            r_cur = r[pending]
+            done = (has_k & (kth <= r_cur)) | (r_cur >= cap)
+
+            keep = done[q] & (pos < k_eff)
+            if max_distance is not None:
+                keep &= d <= max_distance
+            idx_out[pending[q[keep]], pos[keep]] = self.leaf_order[node[keep] - self.leaf_start]
+            dist_out[pending[q[keep]], pos[keep]] = d[keep]
+
+            r_next = torch.where(has_k, kth * (1 + 1e-6), r_cur * 2).clamp_max(cap)
+            r[pending] = torch.where(done, r_cur, r_next)
+            pending = pending[~done]
+        return dist_out, idx_out
+
+    def self_join(self, *, mode: QueryMode = "intersects", sort: bool = False,
+                  chunk_size: int | None = None, max_pairs: int | None = None) -> QueryResult:
+        """
+        Pairs (i, j) of indexed boxes with i < j that satisfy `mode` (box j
+        relative to box i as the query). Each unordered pair is reported once.
+        """
+        lo, hi = self.boxes()
+        res = self.search(lo, hi, mode=mode, sort=sort, chunk_size=chunk_size, max_pairs=max_pairs,
+                          validate=False)
+        keep = res.query_idx < res.box_idx
+        q, b = res.query_idx[keep], res.box_idx[keep]
+        return QueryResult(q, b, torch.bincount(q, minlength=self.num_boxes))
+
+    def _axis_scale(self, axis_scale: Any | None) -> Tensor:
+        if axis_scale is None:
+            return torch.ones(self.ndim, dtype=self.dtype, device=self.device)
+        s = torch.as_tensor(axis_scale, dtype=self.dtype, device=self.device).reshape(-1)
+        if s.numel() != self.ndim:
+            raise ValueError(f"axis_scale must have {self.ndim} entries, got {s.numel()}")
+        if not (s > 0).all():
+            raise ValueError("axis_scale entries must be > 0")
+        return s
 
 
 # -----------------------------------------------------------------------------
-# Construction
-# -----------------------------------------------------------------------------
-
-def build_rtree(mins: Tensor, maxs: Tensor, m: int = 8, curve: Curve = "hilbert") -> RTree:
-    """
-    Build a packed R-tree bottom-up by sorting leaves along a space-filling
-    curve. `m` is the fan-out (children per internal node); `curve` selects
-    the leaf ordering. "hilbert" (default) gives tighter nodes and 20-50%
-    faster queries; "morton" builds about 1.6x faster.
-    """
-    _validate_boxes(mins, maxs, name="build_rtree")
-    if m < 2:
-        raise ValueError(f"m must be >= 2, got {m}")
-    n, ndim = mins.shape
-    device, dtype = mins.device, mins.dtype
-
-    # 1. Sort leaves by SFC key of their centers.
-    if n > 0:
-        centers = (mins + maxs) * 0.5
-        g_min = mins.amin(dim=0)
-        g_range = (maxs.amax(dim=0) - g_min).clamp_min(torch.finfo(dtype).tiny)
-        order = torch.argsort(_sfc_codes(centers, g_min, g_range, curve))
-    else:
-        order = torch.empty(0, dtype=torch.int64, device=device)
-    leaf_mins, leaf_maxs = mins[order], maxs[order]
-
-    # 2. Compute level sizes (top-down: level 0 = root, last = leaves).
-    sizes_bu = [n]
-    while sizes_bu[-1] > 1:
-        sizes_bu.append((sizes_bu[-1] + m - 1) // m)
-    level_sizes = list(reversed(sizes_bu))
-
-    level_starts = [0]
-    for s in level_sizes:
-        level_starts.append(level_starts[-1] + s)
-    total = level_starts[-1]
-    leaf_start = level_starts[-2]
-
-    # 3. Allocate flat tree tensors.
-    tree_mins = torch.empty((total, ndim), dtype=dtype, device=device)
-    tree_maxs = torch.empty((total, ndim), dtype=dtype, device=device)
-    start_idx = torch.full((total,), -1, dtype=torch.int64, device=device)
-    end_idx = torch.full((total,), -1, dtype=torch.int64, device=device)
-
-    # 4. Place sorted leaves at the bottom.
-    tree_mins[leaf_start:leaf_start + n] = leaf_mins
-    tree_maxs[leaf_start:leaf_start + n] = leaf_maxs
-
-    # 5. Build internal levels bottom-up via reshape + amin/amax over groups.
-    inf = torch.tensor(float("inf"), dtype=dtype, device=device)
-    for level in range(len(level_sizes) - 2, -1, -1):
-        ls, sz = level_starts[level], level_sizes[level]
-        cls_, csz = level_starts[level + 1], level_sizes[level + 1]
-
-        cpn = min(-(-csz // sz), m)  # ceil(csz / sz), capped at m
-        idx = torch.arange(sz, device=device)
-        sc = idx * cpn
-        ec = (sc + cpn - 1).clamp_max(csz - 1)
-        start_idx[ls:ls + sz] = cls_ + sc
-        end_idx[ls:ls + sz] = cls_ + ec
-
-        c_mins = tree_mins[cls_:cls_ + csz]
-        c_maxs = tree_maxs[cls_:cls_ + csz]
-        pad = sz * cpn - csz
-        if pad > 0:
-            # Pad with +inf / -inf so they're identities under amin / amax.
-            c_mins = torch.cat([c_mins, inf.expand(pad, ndim)], dim=0)
-            c_maxs = torch.cat([c_maxs, (-inf).expand(pad, ndim)], dim=0)
-        tree_mins[ls:ls + sz] = c_mins.view(sz, cpn, ndim).amin(dim=1)
-        tree_maxs[ls:ls + sz] = c_maxs.view(sz, cpn, ndim).amax(dim=1)
-
-    return RTree(
-        mins=tree_mins,
-        maxs=tree_maxs,
-        start_indices=start_idx,
-        end_indices=end_idx,
-        level_starts=torch.tensor(level_starts, dtype=torch.int64, device=device),
-        leaf_order=order,
-        leaf_start=leaf_start,
-        num_leaves=n,
-        m=m,
-        ndim=ndim,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Query — level-synchronous frontier expansion
+# Traversal
 # -----------------------------------------------------------------------------
 
 def _node_test(tree: RTree, node: Tensor, qmins: Tensor, qmaxs: Tensor, q: Tensor,
@@ -315,240 +533,78 @@ def _node_test(tree: RTree, node: Tensor, qmins: Tensor, qmaxs: Tensor, q: Tenso
     """Predicate for (query q[i], node node[i]) pairs under the given mode."""
     nmin, nmax = tree.mins[node], tree.maxs[node]
     qmin, qmax = qmins[q], qmaxs[q]
-    if mode == "within" or (mode == "contains" and leaf):
-        # 'within': the query box lies inside the node/leaf box. This is a
-        # valid pruning test at internal levels too, since ancestors contain
-        # their leaves. 'contains' at the leaf: the leaf box lies inside the
-        # query box.
-        if mode == "contains":
-            return (qmin <= nmin).all(dim=-1) & (nmax <= qmax).all(dim=-1)
+    if mode == "within":
+        # Query inside node. Valid pruning at internal levels too, since
+        # ancestors contain their leaves.
         return (nmin <= qmin).all(dim=-1) & (qmax <= nmax).all(dim=-1)
-    # closed-interval intersection (also the internal-node test for 'contains')
+    if mode == "contains" and leaf:
+        return (qmin <= nmin).all(dim=-1) & (nmax <= qmax).all(dim=-1)
+    # Closed-interval intersection (also the internal-node test for 'contains').
     return (nmin <= qmax).all(dim=-1) & (nmax >= qmin).all(dim=-1)
 
 
-def _frontier_query(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
-                    max_pairs: int | None) -> tuple[Tensor, Tensor]:
+def _frontier(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
+              max_pairs: int | None) -> tuple[Tensor, Tensor]:
     """Core traversal. Returns (query_idx, node_idx) with node_idx in tree space."""
-    Q = qmins.shape[0]
-    device = tree.device
-    if Q == 0 or tree.num_leaves == 0:
+    Q, device = qmins.shape[0], tree.device
+    if Q == 0 or tree.num_boxes == 0:
         e = torch.empty(0, dtype=torch.int64, device=device)
         return e, e.clone()
 
-    level_starts = tree.level_starts.tolist()
-    num_levels = len(level_starts) - 1
-    level_sizes = [level_starts[i + 1] - level_starts[i] for i in range(num_levels)]
-
     fq = torch.arange(Q, device=device)
     fn = torch.zeros(Q, dtype=torch.int64, device=device)  # root
-
-    def guard(n_pairs: int):
-        if max_pairs is not None and n_pairs > max_pairs:
-            raise RuntimeError(
-                f"query frontier reached {n_pairs} (query, node) pairs, above max_pairs={max_pairs}; "
-                f"pass a larger max_pairs, a chunk_size, or narrow the queries"
-            )
-
-    for level in range(num_levels - 1):  # internal levels
+    ls = tree.level_starts
+    for level, cpn in enumerate(tree.level_fanout):  # internal levels, top-down
         hit = _node_test(tree, fn, qmins, qmaxs, fq, mode, leaf=False)
         fq, fn = fq[hit], fn[hit]
-        cpn = min(-(-level_sizes[level + 1] // level_sizes[level]), tree.m)
-        start, end = tree.start_indices[fn], tree.end_indices[fn]
-        child = start.unsqueeze(1) + torch.arange(cpn, device=device)   # (F, cpn)
-        valid = child <= end.unsqueeze(1)
+        first = ls[level + 1] + (fn - ls[level]) * cpn
+        child = first.unsqueeze(1) + torch.arange(cpn, device=device)   # (F, cpn)
+        valid = child < ls[level + 2]                                     # last node may be short
         fq = fq.unsqueeze(1).expand_as(child)[valid]
         fn = child[valid]
-        guard(fn.numel())
+        if max_pairs is not None and fn.numel() > max_pairs:
+            raise RuntimeError(
+                f"query frontier reached {fn.numel()} (query, node) pairs, above max_pairs={max_pairs}; "
+                f"pass a larger max_pairs, a chunk_size, or narrow the queries")
 
     hit = _node_test(tree, fn, qmins, qmaxs, fq, mode, leaf=True)
     return fq[hit], fn[hit]
 
 
-def _prepare_queries(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str) -> tuple[Tensor, Tensor]:
-    if mode not in _MODES:
-        raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
-    _validate_boxes(qmins, qmaxs, name="query", ndim=tree.ndim)
-    return (qmins.to(device=tree.device, dtype=tree.dtype),
-            qmaxs.to(device=tree.device, dtype=tree.dtype))
-
-
-def query_rtree_pairs(
-    tree: RTree,
-    query_mins: Tensor,   # (Q, ndim)
-    query_maxs: Tensor,   # (Q, ndim)
-    mode: QueryMode = "intersects",
-    chunk_size: int | None = None,
-    max_pairs: int | None = None,
-) -> tuple[Tensor, Tensor]:
-    """
-    Ragged query. Returns (query_idx, leaf_idx): int64 tensors of equal length
-    P (total hits), grouped by ascending query index; leaf_idx are original
-    input indices.
-
-    mode:        "intersects" (boxes overlapping the query, closed intervals),
-                 "contains"   (boxes lying entirely inside the query),
-                 "within"     (boxes that entirely contain the query).
-    chunk_size:  process at most this many queries at once to bound memory.
-    max_pairs:   raise if any level's frontier exceeds this many pairs.
-    """
-    qmins, qmaxs = _prepare_queries(tree, query_mins, query_maxs, mode)
+def _run_frontier(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
+                  chunk_size: int | None, max_pairs: int | None) -> tuple[Tensor, Tensor]:
     Q = qmins.shape[0]
     if chunk_size is None or chunk_size >= Q:
-        fq, fn = _frontier_query(tree, qmins, qmaxs, mode, max_pairs)
-        return fq, tree.leaf_order[fn - tree.leaf_start]
+        return _frontier(tree, qmins, qmaxs, mode, max_pairs)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    qs, ls = [], []
-    for s in range(0, Q, chunk_size):
-        fq, fn = _frontier_query(tree, qmins[s:s + chunk_size], qmaxs[s:s + chunk_size], mode, max_pairs)
-        qs.append(fq + s)
-        ls.append(tree.leaf_order[fn - tree.leaf_start])
-    return torch.cat(qs), torch.cat(ls)
-
-
-def _group_positions(q_idx: Tensor, Q: int) -> tuple[Tensor, Tensor]:
-    """For pairs grouped by query, return (counts (Q,), position within group (P,))."""
-    counts = torch.bincount(q_idx, minlength=Q)
-    group_start = counts.cumsum(0) - counts
-    pos = torch.arange(q_idx.numel(), device=q_idx.device) - group_start[q_idx]
-    return counts, pos
-
-
-def query_rtree(
-    tree: RTree,
-    query_mins: Tensor,      # (Q, ndim)
-    query_maxs: Tensor,      # (Q, ndim)
-    max_results: int = -1,   # -1 → widest query's hit count (no truncation)
-    mode: QueryMode = "intersects",
-    chunk_size: int | None = None,
-    max_pairs: int | None = None,
-) -> tuple[Tensor, Tensor]:
-    """
-    Padded query, built on query_rtree_pairs.
-
-    Returns:
-        results       (Q, max_results) int64 — original leaf indices, padded -1
-        result_counts (Q,) int64 — total hits per query (may exceed max_results)
-    """
-    Q = query_mins.shape[0]
-    q_idx, leaf_idx = query_rtree_pairs(tree, query_mins, query_maxs, mode, chunk_size, max_pairs)
-    counts, pos = _group_positions(q_idx, Q)
-    if max_results <= 0:
-        max_results = int(counts.max().item()) if Q > 0 else 0
-    max_results = max(max_results, 1)
-    keep = pos < max_results
-    results = torch.full((Q, max_results), -1, dtype=torch.int64, device=tree.device)
-    results[q_idx[keep], pos[keep]] = leaf_idx[keep]
-    return results, counts
-
-
-def query_rtree_points(tree: RTree, points: Tensor, **kw) -> tuple[Tensor, Tensor]:
-    """Boxes containing each point. Same return convention as query_rtree_pairs."""
-    return query_rtree_pairs(tree, points, points, "intersects", **kw)
-
-
-# -----------------------------------------------------------------------------
-# k-nearest boxes to points (Euclidean point-to-box distance, raw units)
-# -----------------------------------------------------------------------------
-
-def _point_box_distance(tree: RTree, node: Tensor, pts: Tensor) -> Tensor:
-    below = (tree.mins[node] - pts).clamp_min(0)
-    above = (pts - tree.maxs[node]).clamp_min(0)
-    return (below * below + above * above).sum(dim=-1).sqrt()
-
-
-def query_rtree_nearest(
-    tree: RTree,
-    points: Tensor,   # (Q, ndim)
-    k: int = 1,
-    chunk_size: int | None = None,
-    max_pairs: int | None = None,
-) -> tuple[Tensor, Tensor]:
-    """
-    k nearest boxes to each point by Euclidean point-to-box distance (zero when
-    the point lies inside the box). Distances mix axes in raw units, so scale
-    axes yourself for mixed-unit (e.g. spatio-temporal) data.
-
-    Implemented as an expanding box search: each point queries a cube of
-    radius r, and is finished once it has >= k candidates whose k-th distance
-    is <= r (the cube contains the ball of radius r, so nothing closer was
-    missed). A point with >= k candidates but a k-th distance beyond r retries
-    once with r = that distance; a point with fewer doubles r.
-
-    Returns:
-        idx  (Q, k) int64 — original box indices, ascending distance, -1 padded
-        dist (Q, k)       — matching distances, +inf padded
-    """
-    if k < 1:
-        raise ValueError(f"k must be >= 1, got {k}")
-    _validate_boxes(points, points, name="nearest", ndim=tree.ndim)
-    pts_all = points.to(device=tree.device, dtype=tree.dtype)
-    Q = pts_all.shape[0]
-    device, dtype = tree.device, tree.dtype
-    idx_out = torch.full((Q, k), -1, dtype=torch.int64, device=device)
-    dist_out = torch.full((Q, k), float("inf"), dtype=dtype, device=device)
-    if Q == 0 or tree.num_leaves == 0:
-        return idx_out, dist_out
-    k_eff = min(k, tree.num_leaves)
-
-    root_lo, root_hi = tree.mins[0], tree.maxs[0]
-    ranges = (root_hi - root_lo).double()
-    extent = float(ranges.amax().item())
-    # Initial radius: half the side of the cube that would hold ~k boxes if
-    # they were spread uniformly over the root box. Using the root VOLUME
-    # (not the widest axis) keeps this sane on anisotropic data such as a
-    # time axis with a far wider range than the spatial axes.
-    volume = float(ranges.clamp_min(extent * 1e-3).prod().item()) if extent > 0 else 0.0
-    r0 = 0.5 * (k_eff / tree.num_leaves * volume) ** (1.0 / tree.ndim)
-    r0 = max(r0, extent * 1e-6, 1e-30)
-    # Beyond this radius every box is in range, so the search is exhaustive.
-    r_max = float((torch.maximum((pts_all - root_lo).abs(), (pts_all - root_hi).abs()).amax()).item()) + 1.0
-
-    pending = torch.arange(Q, device=device)
-    # Points outside the root box start at their distance to it, so the first
-    # cube already touches the tree instead of doubling up from nothing.
-    root_node = torch.zeros(Q, dtype=torch.int64, device=device)
-    d_root = _point_box_distance(tree, root_node, pts_all) * 1.001
-    r = d_root.clamp_min(r0)
-
-    while pending.numel() > 0:
-        pts = pts_all[pending]
-        rad = r[pending].unsqueeze(1)
-        q, node = _frontier_query(tree, pts - rad, pts + rad, "intersects", max_pairs) \
-            if chunk_size is None else _chunked_frontier(tree, pts - rad, pts + rad, chunk_size, max_pairs)
-        d = _point_box_distance(tree, node, pts[q])
-
-        # Sort pairs by (query, distance): sort by distance, then stable sort by query.
-        d, perm = torch.sort(d)
-        q, node = q[perm], node[perm]
-        q, perm = torch.sort(q, stable=True)
-        d, node = d[perm], node[perm]
-
-        counts, pos = _group_positions(q, pts.shape[0])
-        has_k = counts >= k_eff
-        kth = torch.full((pts.shape[0],), float("inf"), dtype=dtype, device=device)
-        sel = pos == (k_eff - 1)
-        kth[q[sel]] = d[sel]
-        done = (has_k & (kth <= r[pending])) | (r[pending] >= r_max)
-
-        keep = done[q] & (pos < k_eff)
-        idx_out[pending[q[keep]], pos[keep]] = tree.leaf_order[node[keep] - tree.leaf_start]
-        dist_out[pending[q[keep]], pos[keep]] = d[keep]
-
-        # Enough candidates but the k-th lies outside the ball: one more pass at
-        # exactly that radius is guaranteed to finish. Otherwise double.
-        r_cur = r[pending]
-        r[pending] = torch.where(done, r_cur, torch.where(has_k, kth * (1 + 1e-6), r_cur * 2))
-        pending = pending[~done]
-    return idx_out, dist_out
-
-
-def _chunked_frontier(tree, qmins, qmaxs, chunk_size, max_pairs):
     qs, ns = [], []
-    for s in range(0, qmins.shape[0], chunk_size):
-        lo, hi = qmins[s:s + chunk_size], qmaxs[s:s + chunk_size]
-        fq, fn = _frontier_query(tree, lo, hi, "intersects", max_pairs)
+    for s in range(0, Q, chunk_size):
+        fq, fn = _frontier(tree, qmins[s:s + chunk_size], qmaxs[s:s + chunk_size], mode, max_pairs)
         qs.append(fq + s)
         ns.append(fn)
     return torch.cat(qs), torch.cat(ns)
+
+
+def _box_distance(tree: RTree, node: Tensor, qmins: Tensor, qmaxs: Tensor, scale: Tensor) -> Tensor:
+    """Euclidean gap between query boxes and tree nodes, per-axis gaps scaled."""
+    gap = torch.maximum(tree.mins[node] - qmaxs, qmins - tree.maxs[node]).clamp_min(0) * scale
+    return (gap * gap).sum(dim=-1).sqrt()
+
+
+def _step_down(x: Tensor) -> Tensor:
+    """Round a search bound outward by one ulp so float rounding cannot shrink the cube."""
+    return torch.nextafter(x, torch.full_like(x, float("-inf")))
+
+
+def _step_up(x: Tensor) -> Tensor:
+    return torch.nextafter(x, torch.full_like(x, float("inf")))
+
+
+# -----------------------------------------------------------------------------
+# Functional alias
+# -----------------------------------------------------------------------------
+
+def build_rtree(mins: Any, maxs: Any | None = None, *, fanout: int = 8, curve: Curve = "hilbert") -> RTree:
+    """Alias for RTree(mins, maxs, fanout=..., curve=...)."""
+    return RTree(mins, maxs, fanout=fanout, curve=curve)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchrtree"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Static packed R-tree for 2D, 3D and 3D+time boxes in pure PyTorch, on CPU or GPU"
 authors = [{ name = "Grigoriy Kondyukov" }]
 readme = "README.md"
@@ -21,6 +21,12 @@ dev = ["pytest>=7", "ruff>=0.5", "numpy>=1.24", "rtree>=1.0"]
 
 [tool.setuptools.packages.find]
 include = ["torchrtree*"]
+
+[tool.setuptools.package-data]
+torchrtree = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "torchrtree.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

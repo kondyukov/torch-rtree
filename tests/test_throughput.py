@@ -11,10 +11,9 @@ import pytest
 pytest.importorskip("rtree", reason="libspatialindex baseline not installed")
 
 from benchmarks.bench_rtree import format_table, run_config  # noqa: E402
-from torchrtree import SUPPORTED_NDIMS  # noqa: E402
 
 
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
+@pytest.mark.parametrize("ndim", (2, 3, 4))
 def test_backends_agree_and_report(ndim):
     rows = run_config(n=5_000, q=300, ndim=ndim)
     print("\n" + format_table(rows))

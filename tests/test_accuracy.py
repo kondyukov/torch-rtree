@@ -3,22 +3,15 @@ Accuracy tests: every query path must match a brute-force tensor oracle, for
 every supported ndim, dtype, curve and device.
 """
 
+import numpy as np
 import pytest
 import torch
 
-from torchrtree import (
-    SUPPORTED_DTYPES,
-    SUPPORTED_NDIMS,
-    RTree,
-    build_rtree,
-    query_rtree,
-    query_rtree_nearest,
-    query_rtree_pairs,
-    query_rtree_points,
-)
-from torchrtree.rtree import _hilbert_codes, _sfc_codes
+from torchrtree import SUPPORTED_DTYPES, QueryResult, RTree, build_rtree
+from torchrtree._curves import hilbert_codes, sfc_bits, sfc_codes
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+NDIMS = (1, 2, 3, 4)
 
 
 # -----------------------------------------------------------------------------
@@ -48,8 +41,18 @@ def _brute(mins, maxs, qmins, qmaxs, mode="intersects"):
     raise ValueError(mode)
 
 
-def _pairs_to_set(q_idx, leaf_idx):
-    return set(zip(q_idx.tolist(), leaf_idx.tolist(), strict=True))
+def _brute_dist(mins, maxs, qmins, qmaxs, scale=None):
+    """(Q, N) box-to-box Euclidean distance with optional per-axis scale."""
+    below, above = mins.unsqueeze(0) - qmaxs.unsqueeze(1), qmins.unsqueeze(1) - maxs.unsqueeze(0)
+    gap = torch.maximum(below, above).clamp_min(0)
+    if scale is not None:
+        gap = gap * scale
+    return (gap * gap).sum(-1).sqrt()
+
+
+def _pairs(res):
+    q, b = res
+    return set(zip(q.tolist(), b.tolist(), strict=True))
 
 
 def _expected_pairs(expected):
@@ -58,58 +61,70 @@ def _expected_pairs(expected):
 
 
 # -----------------------------------------------------------------------------
-# box queries
+# box search
 # -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
+@pytest.mark.parametrize("ndim", NDIMS)
 @pytest.mark.parametrize("n", [1, 7, 8, 9, 500, 3000])
 def test_intersects_matches_brute_force(device, ndim, n):
     gen = torch.Generator().manual_seed(1234 + n + ndim)
     mins, maxs = _random_boxes(n, ndim, device, gen, extent=1000.0)
-    tree = build_rtree(mins, maxs, m=8)
-
+    tree = RTree(mins, maxs)
     qmins, qmaxs = _random_boxes(64, ndim, device, gen, extent=1000.0, size=0.2)
     expected = _brute(mins, maxs, qmins, qmaxs)
 
-    results, counts = query_rtree(tree, qmins, qmaxs)
-    assert counts.tolist() == expected.sum(-1).tolist()
-    for row, c, exp_row in zip(results.tolist(), counts.tolist(), expected, strict=True):
+    res = tree.search(qmins, qmaxs)
+    assert isinstance(res, QueryResult)
+    assert res.counts.tolist() == expected.sum(-1).tolist()
+    assert (res.query_idx[1:] >= res.query_idx[:-1]).all()
+    assert _pairs(res) == _expected_pairs(expected)
+    assert torch.equal(res.offsets[1:] - res.offsets[:-1], res.counts)
+    assert torch.equal(tree.count(qmins, qmaxs), res.counts)
+
+    # Padded view and per-query access agree with the pairs.
+    padded = res.to_padded()
+    for qi, row in enumerate(padded.tolist()):
         got = {r for r in row if r >= 0}
-        assert got == set(torch.nonzero(exp_row).flatten().tolist())
-        assert len(got) == c
+        assert got == set(res[qi].tolist()) == set(torch.nonzero(expected[qi]).flatten().tolist())
 
-    q_idx, leaf_idx = query_rtree_pairs(tree, qmins, qmaxs)
-    assert q_idx.shape == leaf_idx.shape
-    assert (q_idx[1:] >= q_idx[:-1]).all()
-    assert _pairs_to_set(q_idx, leaf_idx) == _expected_pairs(expected)
+    # sort=True orders box ids within each query.
+    srt = tree.search(qmins, qmaxs, sort=True)
+    assert _pairs(srt) == _pairs(res)
+    for qi in range(64):
+        ids = srt[qi].tolist()
+        assert ids == sorted(ids)
 
 
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("mode", ["contains", "within"])
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
-def test_contains_and_within_modes(mode, ndim):
+@pytest.mark.parametrize("ndim", (2, 3, 4))
+def test_contains_and_within_modes(device, mode, ndim):
     gen = torch.Generator().manual_seed(99 + ndim)
-    mins, maxs = _random_boxes(2000, ndim, gen=gen, size=0.1)
-    tree = build_rtree(mins, maxs)
-    # 'contains' wants big queries; 'within' wants tiny ones so some boxes contain them.
+    mins, maxs = _random_boxes(2000, ndim, device, gen, size=0.1)
+    tree = RTree(mins, maxs)
     size = 0.3 if mode == "contains" else 0.005
-    qmins, qmaxs = _random_boxes(100, ndim, gen=gen, size=size)
+    qmins, qmaxs = _random_boxes(100, ndim, device, gen, size=size)
     expected = _brute(mins, maxs, qmins, qmaxs, mode)
     assert expected.any(), "degenerate test configuration"
-    q_idx, leaf_idx = query_rtree_pairs(tree, qmins, qmaxs, mode=mode)
-    assert _pairs_to_set(q_idx, leaf_idx) == _expected_pairs(expected)
-    assert _pairs_to_set(*tree.query_pairs(qmins, qmaxs, mode=mode)) == _expected_pairs(expected)
+    assert _pairs(tree.search(qmins, qmaxs, mode=mode)) == _expected_pairs(expected)
+    assert torch.equal(tree.count(qmins, qmaxs, mode=mode), expected.sum(-1))
 
 
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
-def test_point_queries(ndim):
+@pytest.mark.parametrize("ndim", (1, 2, 3, 4, 5))
+def test_point_queries_and_point_index(ndim):
     gen = torch.Generator().manual_seed(5)
     mins, maxs = _random_boxes(2000, ndim, gen=gen, size=0.1)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     pts = torch.rand((200, ndim), generator=gen)
     expected = _brute(mins, maxs, pts, pts)
-    assert _pairs_to_set(*query_rtree_points(tree, pts)) == _expected_pairs(expected)
-    assert _pairs_to_set(*tree.query_points(pts)) == _expected_pairs(expected)
+    assert _pairs(tree.search(pts)) == _expected_pairs(expected)
+
+    # Index of points, queried by boxes.
+    ptree = RTree(pts)
+    assert ptree.num_boxes == 200
+    qmins, qmaxs = _random_boxes(50, ndim, gen=gen, size=0.3)
+    assert _pairs(ptree.search(qmins, qmaxs)) == _expected_pairs(_brute(pts, pts, qmins, qmaxs))
 
 
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPES)
@@ -117,22 +132,110 @@ def test_point_queries(ndim):
 def test_dtypes_and_curves(dtype, curve):
     gen = torch.Generator().manual_seed(21)
     mins, maxs = _random_boxes(1500, 3, gen=gen, dtype=dtype)
-    tree = build_rtree(mins, maxs, curve=curve)
-    assert tree.dtype == dtype
+    tree = RTree(mins, maxs, curve=curve)
+    assert tree.dtype == dtype and tree.curve == curve
     qmins, qmaxs = _random_boxes(50, 3, gen=gen, size=0.2, dtype=dtype)
-    expected = _brute(mins, maxs, qmins, qmaxs)
-    assert _pairs_to_set(*query_rtree_pairs(tree, qmins, qmaxs)) == _expected_pairs(expected)
+    assert _pairs(tree.search(qmins, qmaxs)) == _expected_pairs(_brute(mins, maxs, qmins, qmaxs))
 
 
 def test_float64_keeps_timestamp_resolution():
-    # Unix-epoch seconds in float32 have ~128 s resolution; float64 must not merge these.
     t0 = 1_700_000_000.0
     mins = torch.tensor([[0.0, 0.0, 0.0, t0 + i] for i in range(10)], dtype=torch.float64)
     maxs = mins + torch.tensor([1.0, 1.0, 1.0, 0.5], dtype=torch.float64)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     q = torch.tensor([[0.0, 0.0, 0.0, t0 + 3.2]], dtype=torch.float64)
-    q_idx, leaf_idx = query_rtree_pairs(tree, q, q + torch.tensor([1.0, 1.0, 1.0, 0.1], dtype=torch.float64))
-    assert leaf_idx.tolist() == [3]
+    _, box = tree.search(q, q + torch.tensor([1.0, 1.0, 1.0, 0.1], dtype=torch.float64))
+    assert box.tolist() == [3]
+
+
+def test_infinite_query_bounds_are_half_open_ranges():
+    gen = torch.Generator().manual_seed(4)
+    mins, maxs = _random_boxes(500, 4, gen=gen, extent=100.0)
+    tree = RTree(mins, maxs)
+    qmin = torch.tensor([[-float("inf"), -float("inf"), -float("inf"), 50.0]])
+    qmax = torch.tensor([[float("inf"), float("inf"), float("inf"), float("inf")]])
+    _, box = tree.search(qmin, qmax)
+    expected = torch.nonzero(maxs[:, 3] >= 50.0).flatten().tolist()
+    assert sorted(box.tolist()) == expected
+    with pytest.raises(ValueError, match="finite"):
+        RTree(qmin, qmax)  # data boxes must stay finite
+
+
+# -----------------------------------------------------------------------------
+# inputs
+# -----------------------------------------------------------------------------
+
+def test_accepts_numpy_lists_ints_and_single_boxes():
+    rng = np.random.default_rng(0)
+    lo = rng.integers(0, 1000, (300, 2))
+    hi = lo + rng.integers(0, 50, (300, 2))
+    tree = RTree(lo, hi)  # numpy int64
+    assert tree.dtype == torch.float64
+    t = torch.tensor([[100, 100], [300, 300]])
+    res = tree.search(t[0], t[1])  # a single box as two 1-D vectors
+    assert res.num_queries == 1
+    lo64, hi64 = torch.from_numpy(lo).double(), torch.from_numpy(hi).double()
+    expected = _brute(lo64, hi64, t[:1].double(), t[1:].double())
+    assert set(res[0].tolist()) == set(torch.nonzero(expected[0]).flatten().tolist())
+    assert res.to_list() == [res[0].tolist()]
+    assert _pairs(tree.search([[100, 100]], [[300, 300]])) == _pairs(res)  # nested lists
+    assert _pairs(tree.search(np.array([[100, 100]]), np.array([[300, 300]]))) == _pairs(res)
+    assert RTree(lo.astype(np.float16), hi.astype(np.float16)).dtype == torch.float32
+    with pytest.raises(TypeError, match="dtype"):
+        RTree(lo > 5, hi > 5)
+
+
+def test_from_bounds_and_boxes_roundtrip():
+    gen = torch.Generator().manual_seed(2)
+    mins, maxs = _random_boxes(400, 3, gen=gen)
+    tree = RTree.from_bounds(torch.cat([mins, maxs], dim=1))
+    lo, hi = tree.boxes()
+    assert torch.equal(lo, mins) and torch.equal(hi, maxs)
+    b_lo, b_hi = tree.bounds
+    assert torch.equal(b_lo, mins.amin(0)) and torch.equal(b_hi, maxs.amax(0))
+    with pytest.raises(ValueError, match="2 \\* ndim"):
+        RTree.from_bounds(torch.rand(5, 3))
+
+
+def test_build_detaches_and_does_not_mutate_inputs():
+    mins = torch.rand(100, 2, requires_grad=True)
+    maxs = mins + 0.1
+    copy = mins.detach().clone()
+    tree = RTree(mins, maxs)
+    assert not tree.mins.requires_grad and tree.mins.grad_fn is None
+    assert torch.equal(mins.detach(), copy)
+    res = tree.search(mins, maxs)  # queries requiring grad are fine too
+    assert len(res) >= 100
+
+
+def test_identical_and_duplicate_boxes():
+    same = torch.zeros(50, 3)
+    tree = RTree(same, same + 1)  # zero-range curve normalisation
+    res = tree.search(torch.tensor([[0.5, 0.5, 0.5]]))
+    assert sorted(res[0].tolist()) == list(range(50))
+    dup = torch.tensor([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+    tree = RTree(dup, dup + 0.5)
+    assert sorted(tree.search(torch.tensor([[0.1, 0.1]]))[0].tolist()) == [0, 1]
+
+
+@pytest.mark.parametrize("ndim", [0, 9])
+def test_unsupported_ndim(ndim):
+    boxes = torch.rand((10, ndim))
+    with pytest.raises(ValueError, match="ndim"):
+        RTree(boxes, boxes + 0.1)
+
+
+def test_reproducible_leaf_order_across_devices():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    gen = torch.Generator().manual_seed(9)
+    mins, maxs = _random_boxes(5000, 2, gen=gen)
+    a = RTree(mins, maxs)
+    b = RTree(mins.cuda(), maxs.cuda())
+    assert torch.equal(a.leaf_order, b.leaf_order.cpu())
+    qmins, qmaxs = _random_boxes(30, 2, gen=gen, size=0.2)
+    ra, rb = a.search(qmins, qmaxs), b.search(qmins, qmaxs)
+    assert torch.equal(ra.box_idx, rb.box_idx.cpu())  # same order, not just same set
 
 
 # -----------------------------------------------------------------------------
@@ -142,73 +245,73 @@ def test_float64_keeps_timestamp_resolution():
 def test_chunk_size_is_transparent():
     gen = torch.Generator().manual_seed(8)
     mins, maxs = _random_boxes(3000, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     qmins, qmaxs = _random_boxes(257, 2, gen=gen, size=0.2)
-    full = query_rtree_pairs(tree, qmins, qmaxs)
+    full = tree.search(qmins, qmaxs)
     for cs in (1, 100, 256, 257, 10_000):
-        chunked = query_rtree_pairs(tree, qmins, qmaxs, chunk_size=cs)
-        assert torch.equal(full[0], chunked[0]) and torch.equal(full[1], chunked[1])
-    r1, c1 = query_rtree(tree, qmins, qmaxs)
-    r2, c2 = query_rtree(tree, qmins, qmaxs, chunk_size=50)
-    assert torch.equal(r1, r2) and torch.equal(c1, c2)
+        chunked = tree.search(qmins, qmaxs, chunk_size=cs)
+        assert torch.equal(full.query_idx, chunked.query_idx) and torch.equal(full.box_idx, chunked.box_idx)
+    with pytest.raises(ValueError, match="chunk_size"):
+        tree.search(qmins, qmaxs, chunk_size=0)
 
 
 def test_max_pairs_guard():
     gen = torch.Generator().manual_seed(8)
     mins, maxs = _random_boxes(3000, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     everything = (torch.zeros((100, 2)), torch.ones((100, 2)) * 2)
     with pytest.raises(RuntimeError, match="max_pairs"):
-        query_rtree_pairs(tree, *everything, max_pairs=1000)
-    q_idx, _ = query_rtree_pairs(tree, *everything, max_pairs=10_000_000)
-    assert q_idx.numel() == 100 * 3000
+        tree.search(*everything, max_pairs=1000)
+    assert len(tree.search(*everything, max_pairs=10_000_000)) == 100 * 3000
 
 
-def test_max_results_truncation():
+def test_padded_truncation():
     gen = torch.Generator().manual_seed(3)
     mins, maxs = _random_boxes(200, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
-    results, counts = query_rtree(tree, torch.zeros((1, 2)), torch.ones((1, 2)) * 2, max_results=10)
-    assert results.shape == (1, 10) and (results >= 0).all()
-    assert counts.item() == 200  # count is total hits, not truncated
+    res = RTree(mins, maxs).search(torch.zeros((1, 2)), torch.ones((1, 2)) * 2)
+    padded = res.to_padded(max_results=10)
+    assert padded.shape == (1, 10) and (padded >= 0).all()
+    assert res.counts.item() == 200
 
 
 def test_empty_tree_and_empty_queries():
     empty = torch.empty((0, 3))
-    tree = build_rtree(empty, empty)
-    assert tree.num_leaves == 0 and tree.num_nodes == 0
+    tree = RTree(empty, empty)
+    assert tree.num_boxes == 0 and tree.num_nodes == 0 and tree.bounds is None and len(tree) == 0
     far = torch.zeros((5, 3))
-    results, counts = query_rtree(tree, far, far + 1)
-    assert results.shape == (5, 1) and (results == -1).all() and (counts == 0).all()
-    q_idx, leaf_idx = query_rtree_pairs(tree, far, far + 1)
-    assert q_idx.numel() == 0 == leaf_idx.numel()
-    idx, dist = query_rtree_nearest(tree, far, k=2)
+    res = tree.search(far, far + 1)
+    assert len(res) == 0 and res.num_queries == 5 and (res.counts == 0).all()
+    assert res.to_padded().shape == (5, 1)
+    dist, idx = tree.nearest(far, k=2)
     assert (idx == -1).all() and torch.isinf(dist).all()
 
     gen = torch.Generator().manual_seed(11)
     mins, maxs = _random_boxes(100, 3, gen=gen)
-    tree = build_rtree(mins, maxs)
-    q_idx, leaf_idx = query_rtree_pairs(tree, empty, empty)
-    assert q_idx.numel() == 0
-    results, counts = query_rtree(tree, torch.full((5, 3), 10.0), torch.full((5, 3), 11.0))
-    assert results.shape == (5, 1) and (results == -1).all() and (counts == 0).all()
+    tree = RTree(mins, maxs)
+    assert len(tree.search(empty, empty)) == 0
+    res = tree.search(torch.full((5, 3), 10.0), torch.full((5, 3), 11.0))
+    assert len(res) == 0 and (res.counts == 0).all()
+    with pytest.raises(IndexError):
+        res[5]
 
 
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
-def test_tree_invariants(ndim):
+@pytest.mark.parametrize("ndim", NDIMS)
+@pytest.mark.parametrize("fanout", [2, 8, 16])
+def test_tree_invariants(ndim, fanout):
     gen = torch.Generator().manual_seed(7)
     mins, maxs = _random_boxes(1000, ndim, gen=gen)
-    tree = build_rtree(mins, maxs, m=8)
+    tree = RTree(mins, maxs, fanout=fanout)
     assert sorted(tree.leaf_order.tolist()) == list(range(1000))
-    leaves = slice(tree.leaf_start, tree.leaf_start + tree.num_leaves)
-    assert torch.equal(tree.mins[leaves], mins[tree.leaf_order])
-    assert torch.equal(tree.maxs[leaves], maxs[tree.leaf_order])
-    for node in range(tree.leaf_start):
-        s, e = tree.start_indices[node].item(), tree.end_indices[node].item()
-        assert 0 <= s <= e < tree.num_nodes
-        assert e - s + 1 <= tree.m
-        assert (tree.mins[node] <= tree.mins[s : e + 1]).all()
-        assert (tree.maxs[node] >= tree.maxs[s : e + 1]).all()
+    assert torch.equal(tree.mins[tree.leaf_start:], mins[tree.leaf_order])
+    assert len(tree.level_fanout) == tree.num_levels - 1
+    ls = tree.level_starts
+    for level, cpn in enumerate(tree.level_fanout):
+        assert 2 <= cpn <= fanout
+        for i in range(ls[level], ls[level + 1]):
+            s = ls[level + 1] + (i - ls[level]) * cpn
+            e = min(s + cpn, ls[level + 2])
+            assert s < e, "every internal node has at least one child"
+            assert (tree.mins[i] <= tree.mins[s:e]).all() and (tree.maxs[i] >= tree.maxs[s:e]).all()
 
 
 # -----------------------------------------------------------------------------
@@ -217,109 +320,144 @@ def test_tree_invariants(ndim):
 
 def test_validation_errors():
     good = torch.rand((10, 2))
-    with pytest.raises(NotImplementedError):
-        build_rtree(torch.rand((10, 5)), torch.rand((10, 5)) + 1)
     with pytest.raises(ValueError, match="min must be <="):
-        build_rtree(good + 1, good)
+        RTree(good + 1, good)
     bad = good.clone()
     bad[3, 1] = float("nan")
     with pytest.raises(ValueError, match="finite"):
-        build_rtree(bad, bad + 1)
+        RTree(bad, bad + 1)
     with pytest.raises(ValueError, match="shape"):
-        build_rtree(torch.rand(10), torch.rand(10))
-    with pytest.raises(TypeError, match="dtype"):
-        build_rtree(good, (good + 1).double())
-    with pytest.raises(TypeError, match="dtype must be"):
-        build_rtree(good.half(), (good + 1).half())
-    with pytest.raises(ValueError, match="m must be"):
-        build_rtree(good, good + 1, m=1)
+        RTree(torch.rand(10), torch.rand(10))
+    with pytest.raises(ValueError, match="differ"):
+        RTree(good, torch.rand(11, 2))
+    with pytest.raises(ValueError, match="fanout"):
+        RTree(good, good + 1, fanout=1)
     with pytest.raises(ValueError, match="curve"):
-        build_rtree(good, good + 1, curve="peano")
-    tree = build_rtree(good, good + 1)
+        RTree(good, good + 1, curve="peano")
+    tree = RTree(good, good + 1)
     with pytest.raises(ValueError, match="ndim=2"):
-        query_rtree_pairs(tree, torch.rand((3, 3)), torch.rand((3, 3)) + 1)
+        tree.search(torch.rand((3, 3)), torch.rand((3, 3)) + 1)
     with pytest.raises(ValueError, match="mode"):
-        query_rtree_pairs(tree, good, good + 1, mode="touches")
+        tree.search(good, good + 1, mode="touches")
+    with pytest.raises(ValueError, match="NaN"):
+        tree.search(bad, bad + 1)
+    tree.search(bad, bad + 1, validate=False)  # caller opts out of the checks
     with pytest.raises(ValueError, match="k must be"):
-        query_rtree_nearest(tree, good, k=0)
+        tree.nearest(good, k=0)
+    with pytest.raises(ValueError, match="axis_scale"):
+        tree.nearest(good, axis_scale=[1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="distance"):
+        tree.within_distance(good, distance=-1.0)
 
 
 # -----------------------------------------------------------------------------
-# nearest
+# nearest / within_distance / self_join
 # -----------------------------------------------------------------------------
-
-def _brute_nearest(mins, maxs, pts, k):
-    below = (mins.unsqueeze(0) - pts.unsqueeze(1)).clamp_min(0)
-    above = (pts.unsqueeze(1) - maxs.unsqueeze(0)).clamp_min(0)
-    d = (below * below + above * above).sum(-1).sqrt()  # (Q, N)
-    return torch.topk(d, k, dim=1, largest=False)
-
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
+@pytest.mark.parametrize("ndim", (1, 2, 3, 4))
 @pytest.mark.parametrize("k", [1, 5])
 def test_nearest_matches_brute_force(device, ndim, k):
     gen = torch.Generator().manual_seed(31 + ndim + k)
     mins, maxs = _random_boxes(2000, ndim, device, gen, size=0.01)
-    tree = build_rtree(mins, maxs)
-    # Points inside the extent and some well outside it.
+    tree = RTree(mins, maxs)
     inside = torch.rand((100, ndim), generator=gen)
     outside = torch.rand((10, ndim), generator=gen) * 4 - 2
     pts = torch.cat([inside, outside]).to(device)
-    idx, dist = query_rtree_nearest(tree, pts, k=k)
-    exp_d, exp_i = _brute_nearest(mins, maxs, pts, k)
+    dist, idx = tree.nearest(pts, k=k)
+    exp_d = torch.topk(_brute_dist(mins, maxs, pts, pts), k, dim=1, largest=False).values
     assert torch.allclose(dist, exp_d, atol=1e-6)
-    # Indices may legitimately differ on exact ties; compare distances at the
-    # returned indices instead.
     assert (idx >= 0).all()
-    assert torch.allclose(_point_box_dist(mins, maxs, pts, idx), exp_d, atol=1e-6)
+    # Ties may pick different boxes; the distances at the returned boxes must still match.
+    got = _brute_dist(mins, maxs, pts, pts).gather(1, idx)
+    assert torch.allclose(got, exp_d, atol=1e-6)
 
 
-def _point_box_dist(mins, maxs, pts, idx):
-    m, M = mins[idx], maxs[idx]  # (Q, k, ndim)
-    p = pts.unsqueeze(1)
-    below = (m - p).clamp_min(0)
-    above = (p - M).clamp_min(0)
-    return (below * below + above * above).sum(-1).sqrt()
+def test_nearest_with_box_queries_scale_and_max_distance():
+    gen = torch.Generator().manual_seed(12)
+    mins, maxs = _random_boxes(1500, 3, gen=gen, size=0.01, extent=100.0)
+    tree = RTree(mins, maxs)
+    qmins, qmaxs = _random_boxes(60, 3, gen=gen, size=0.02, extent=100.0)
+    scale = torch.tensor([1.0, 1.0, 0.01])  # bring the wide axis back to ~unit range
+    dist, idx = tree.nearest(qmins, qmaxs, k=3, axis_scale=scale)
+    full = _brute_dist(mins, maxs, qmins, qmaxs, scale)
+    exp = torch.topk(full, 3, dim=1, largest=False).values
+    assert torch.allclose(dist, exp, atol=1e-5)
+    assert torch.allclose(full.gather(1, idx), exp, atol=1e-5)
+
+    md = float(exp[:, 1].median())
+    dist, idx = tree.nearest(qmins, qmaxs, k=3, axis_scale=scale, max_distance=md)
+    within = exp <= md
+    assert torch.equal(idx >= 0, within)
+    assert torch.allclose(dist[within], exp[within], atol=1e-5) and torch.isinf(dist[~within]).all()
 
 
 def test_nearest_k_exceeds_n_and_chunking():
     gen = torch.Generator().manual_seed(2)
     mins, maxs = _random_boxes(3, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     pts = torch.rand((4, 2), generator=gen)
-    idx, dist = query_rtree_nearest(tree, pts, k=5)
-    assert (idx[:, 3:] == -1).all() and torch.isinf(dist[:, 3:]).all()
-    assert (idx[:, :3] >= 0).all()
-    exp_d, _ = _brute_nearest(mins, maxs, pts, 3)
-    assert torch.allclose(dist[:, :3], exp_d, atol=1e-6)
+    dist, idx = tree.nearest(pts, k=5)
+    assert (idx[:, 3:] == -1).all() and torch.isinf(dist[:, 3:]).all() and (idx[:, :3] >= 0).all()
+    exp = torch.topk(_brute_dist(mins, maxs, pts, pts), 3, dim=1, largest=False).values
+    assert torch.allclose(dist[:, :3], exp, atol=1e-6)
 
     mins, maxs = _random_boxes(500, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
     pts = torch.rand((77, 2), generator=gen)
-    a = tree.nearest(pts, k=3)
-    b = tree.nearest(pts, k=3, chunk_size=10)
+    a, b = tree.nearest(pts, k=3), tree.nearest(pts, k=3, chunk_size=10)
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_within_distance(device):
+    gen = torch.Generator().manual_seed(17)
+    mins, maxs = _random_boxes(2000, 3, device, gen, size=0.02)
+    tree = RTree(mins, maxs)
+    pts = torch.rand((80, 3), generator=gen).to(device)
+    qmins, qmaxs = _random_boxes(40, 3, device, gen, size=0.05)
+    for lo, hi in ((pts, None), (qmins, qmaxs)):
+        hi_ = lo if hi is None else hi
+        for d in (0.0, 0.03, 0.2):
+            res = tree.within_distance(lo, hi, distance=d, sort=True)
+            expected = _brute_dist(mins, maxs, lo, hi_) <= d
+            assert _pairs(res) == _expected_pairs(expected)
+    scale = torch.tensor([1.0, 5.0, 1.0], device=device)
+    res = tree.within_distance(pts, distance=0.1, axis_scale=scale)
+    assert _pairs(res) == _expected_pairs(_brute_dist(mins, maxs, pts, pts, scale) <= 0.1)
+
+
+def test_self_join():
+    gen = torch.Generator().manual_seed(23)
+    mins, maxs = _random_boxes(600, 2, gen=gen, size=0.05)
+    tree = RTree(mins, maxs)
+    res = tree.self_join(sort=True)
+    expected = _brute(mins, maxs, mins, maxs)
+    exp_pairs = {(i, j) for i, j in _expected_pairs(expected) if i < j}
+    assert _pairs(res) == exp_pairs and res.num_queries == 600
+    assert (res.query_idx < res.box_idx).all()
+
+
 # -----------------------------------------------------------------------------
-# container: to / save / load
+# container: repr / to / save / load
 # -----------------------------------------------------------------------------
 
-def test_save_load_roundtrip(tmp_path):
+def test_repr_is_short_and_save_load_roundtrip(tmp_path):
     gen = torch.Generator().manual_seed(1)
     mins, maxs = _random_boxes(300, 2, gen=gen)
-    tree = build_rtree(mins, maxs)
+    tree = RTree(mins, maxs)
+    text = repr(tree)
+    assert text.startswith("RTree(num_boxes=300") and len(text) < 200
+    assert repr(tree.search(mins[:3], maxs[:3])).startswith("QueryResult(num_queries=3")
+
     path = tmp_path / "tree.pt"
     tree.save(path)
     loaded = RTree.load(path)
-    for a, b in zip(tree, loaded, strict=True):
-        if isinstance(a, torch.Tensor):
-            assert torch.equal(a, b)
-        else:
-            assert a == b
+    assert repr(loaded) == text
+    assert torch.equal(tree.mins, loaded.mins) and torch.equal(tree.leaf_order, loaded.leaf_order)
+    assert tree.level_starts == loaded.level_starts and tree.level_fanout == loaded.level_fanout
     qmins, qmaxs = _random_boxes(20, 2, gen=gen, size=0.2)
-    assert torch.equal(tree.query(qmins, qmaxs)[0], loaded.query(qmins, qmaxs)[0])
+    assert torch.equal(tree.search(qmins, qmaxs).box_idx, loaded.search(qmins, qmaxs).box_idx)
     with pytest.raises(ValueError, match="format"):
         RTree.from_state_dict({"format": 99})
 
@@ -328,42 +466,47 @@ def test_save_load_roundtrip(tmp_path):
 def test_to_device_roundtrip():
     gen = torch.Generator().manual_seed(1)
     mins, maxs = _random_boxes(300, 3, gen=gen)
-    tree = build_rtree(mins, maxs)
-    gpu = tree.to("cuda")
-    assert gpu.device.type == "cuda" and tree.to("cpu") is tree
+    tree = RTree(mins, maxs)
+    gpu = tree.cuda()
+    assert gpu.device.type == "cuda" and tree.cpu() is tree and gpu.cuda() is gpu
     qmins, qmaxs = _random_boxes(20, 3, gen=gen, size=0.2)
-    a = tree.query_pairs(qmins, qmaxs)
-    b = gpu.query_pairs(qmins, qmaxs)  # CPU queries are moved to the tree's device
-    assert b[0].device.type == "cuda"
-    assert _pairs_to_set(*a) == _pairs_to_set(b[0].cpu(), b[1].cpu())
+    a, b = tree.search(qmins, qmaxs), gpu.search(qmins, qmaxs)  # CPU queries move to the tree's device
+    assert b.device.type == "cuda"
+    assert _pairs(a) == _pairs(b.to("cpu"))
+    assert torch.equal(gpu.boxes()[0].cpu(), mins)
+
+
+def test_build_rtree_alias():
+    gen = torch.Generator().manual_seed(1)
+    mins, maxs = _random_boxes(50, 2, gen=gen)
+    tree = build_rtree(mins, maxs, fanout=4, curve="morton")
+    assert isinstance(tree, RTree) and tree.fanout == 4 and tree.curve == "morton"
 
 
 # -----------------------------------------------------------------------------
 # curves
 # -----------------------------------------------------------------------------
 
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
-def test_sfc_key_fits_int64_and_is_monotone_on_axis0(ndim):
-    n = 256
-    centers = torch.zeros((n, ndim))
-    centers[:, 0] = torch.linspace(0, 1, n)
+@pytest.mark.parametrize("ndim", (1, 2, 3, 4, 8))
+def test_sfc_keys_fit_int64_and_separate_points(ndim):
+    max_q = (1 << sfc_bits(ndim)) - 1  # the quantiser scales [0, 1] by this
+    n = min(256, max_q)
+    centers = torch.zeros((n, ndim), dtype=torch.float64)
+    centers[:, 0] = (torch.arange(n, dtype=torch.float64) + 0.5) / max_q  # cell midpoints
     for curve in ("morton", "hilbert"):
-        codes = _sfc_codes(centers, torch.zeros(ndim), torch.ones(ndim), curve)
+        codes = sfc_codes(centers, torch.zeros(ndim), torch.ones(ndim), curve)
         assert codes.dtype == torch.int64 and (codes >= 0).all()
-        assert len(set(codes.tolist())) == n, "distinct centres must get distinct keys"
-    # Monotone along one axis is a Morton property (Hilbert folds back on itself).
-    codes = _sfc_codes(centers, torch.zeros(ndim), torch.ones(ndim), "morton")
-    assert (codes[1:] >= codes[:-1]).all()
+        assert len(set(codes.tolist())) == n
+    codes = sfc_codes(centers, torch.zeros(ndim), torch.ones(ndim), "morton")
+    assert (codes[1:] >= codes[:-1]).all()  # monotone along one axis is a Morton property
 
 
-@pytest.mark.parametrize("ndim", SUPPORTED_NDIMS)
+@pytest.mark.parametrize("ndim", (2, 3, 4))
 @pytest.mark.parametrize("bits", [1, 2, 3])
 def test_hilbert_is_a_continuous_space_filling_curve(ndim, bits):
-    # Every cell of the 2^bits grid must get a unique key, and consecutive keys
-    # must be grid neighbours (Manhattan distance 1) — the Hilbert property.
     side = 1 << bits
     grid = torch.cartesian_prod(*[torch.arange(side)] * ndim).reshape(-1, ndim)
-    keys = _hilbert_codes(grid, bits)
+    keys = hilbert_codes(grid, bits)
     assert sorted(keys.tolist()) == list(range(side ** ndim))
     walk = grid[torch.argsort(keys)]
     assert ((walk[1:] - walk[:-1]).abs().sum(-1) == 1).all()

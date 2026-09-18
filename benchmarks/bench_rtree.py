@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import torch
 
-from torchrtree import build_rtree, query_rtree_nearest, query_rtree_pairs
+from torchrtree import RTree
 
 try:
     from rtree import index as _lsi_index
@@ -149,14 +149,13 @@ def run_torch_tree(mins, maxs, qmins, qmaxs, device: str, m: int, curve: str):
     t_mins, t_maxs, t_qmins, t_qmaxs = _to(device, mins, maxs, qmins, qmaxs)
     # Untimed warm-up at full size: first-call kernel compilation and allocator
     # growth otherwise land in the timed build.
-    query_rtree_pairs(build_rtree(t_mins, t_maxs, m=m, curve=curve), t_qmins, t_qmaxs)
+    RTree(t_mins, t_maxs, fanout=m, curve=curve).search(t_qmins, t_qmaxs)
 
     with _Timer(device) as tb:
-        tree = build_rtree(t_mins, t_maxs, m=m, curve=curve)
+        tree = RTree(t_mins, t_maxs, fanout=m, curve=curve)
     with _Timer(device) as tq:
-        q_idx, _ = query_rtree_pairs(tree, t_qmins, t_qmaxs)
-    counts = torch.bincount(q_idx, minlength=qmins.shape[0])
-    return tb.seconds, tq.seconds, counts.cpu().numpy()
+        res = tree.search(t_qmins, t_qmaxs)
+    return tb.seconds, tq.seconds, res.counts.cpu().numpy()
 
 
 def run_brute_force(mins, maxs, qmins, qmaxs, device: str, chunk: int = 512):
@@ -196,10 +195,10 @@ def run_libspatialindex_knn(idx, mins, maxs, pts, k):
 
 def run_torch_knn(mins, maxs, pts, device, m, curve, k):
     t_mins, t_maxs, t_pts = _to(device, mins, maxs, pts)
-    tree = build_rtree(t_mins, t_maxs, m=m, curve=curve)
-    query_rtree_nearest(tree, t_pts, k)  # warm-up
+    tree = RTree(t_mins, t_maxs, fanout=m, curve=curve)
+    tree.nearest(t_pts, k=k)  # warm-up
     with _Timer(device) as tq:
-        idx, dist = query_rtree_nearest(tree, t_pts, k)
+        dist, _ = tree.nearest(t_pts, k=k)
     return tq.seconds, dist.cpu().numpy().astype(np.float64)
 
 
