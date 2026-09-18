@@ -124,3 +124,7 @@ ruff check .
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

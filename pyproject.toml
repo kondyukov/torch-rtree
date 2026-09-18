@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ dynamic = ["version"]
 description = "Static packed R-tree for 2D, 3D and 3D+time boxes in pure PyTorch, on CPU or GPU"
 authors = [{ name = "Grigoriy Kondyukov" }]
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = ["torch>=2.1"]
 classifiers = [
