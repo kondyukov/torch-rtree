@@ -42,7 +42,7 @@ tree.cuda(); tree.save("tree.pt"); RTree.load("tree.pt")
 ## API
 
 | Call | Returns |
-|---|---|
+| --- | --- |
 | `RTree(mins, maxs, fanout=8, curve="hilbert")` | tree over N boxes |
 | `RTree(points)` / `RTree.from_bounds(b)` | tree over points / over an (N, 2·ndim) `[mins…, maxs…]` tensor |
 | `tree.search(qmins, qmaxs=None, mode="intersects", sort=False)` | `QueryResult` |

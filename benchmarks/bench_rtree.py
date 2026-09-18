@@ -227,45 +227,61 @@ def run_config(
     curve: str = "hilbert",
     dist: str = "uniform",
     knn: int = 0,
+    ref: bool = True,
 ) -> list[Result]:
+    """
+    Benchmark one configuration. With ref=True libspatialindex is built and
+    every torch backend is validated against it (exact hit sets; kNN
+    distances). With ref=False the first torch backend (CPU by default) is
+    the reference for the others, which keeps very large query batches
+    tractable where the Python-driven libspatialindex loop would take hours.
+    """
     devices = list(devices) if devices is not None else available_devices()
     mins, maxs = make_boxes(n, ndim, box_size, seed, time_extent=1000.0, dist=dist)
     qmins, qmaxs = make_boxes(q, ndim, query_size, seed + 1, time_extent=1000.0, dist=dist)
     tag = dict(ndim=ndim, n=n, q=q, m=m, curve=curve, dist=dist)
 
     results: list[Result] = []
-    lsi, b = _lsi_build(mins, maxs)  # built once, shared by the box and kNN references
-    s, ref = run_libspatialindex(lsi, qmins, qmaxs)
-    results.append(Result("libspatialindex", "box", **tag, build_s=b, query_s=s, counts_ok=None))
+    lsi, ref_ids = None, None
+    if ref:
+        lsi, b = _lsi_build(mins, maxs)  # built once, shared by the box and kNN references
+        s, ref_ids = run_libspatialindex(lsi, qmins, qmaxs)
+        results.append(Result("libspatialindex", "box", **tag, build_s=b, query_s=s, counts_ok=None))
 
     for dev in devices:
-        b, s, c = run_torch_tree(mins, maxs, qmins, qmaxs, dev, m, curve)
-        results.append(Result(f"torch-{dev}", "box", **tag, build_s=b, query_s=s,
-                              counts_ok=bool(np.array_equal(c, ref))))
+        b, s, ids = run_torch_tree(mins, maxs, qmins, qmaxs, dev, m, curve)
+        ok = None if ref_ids is None else bool(np.array_equal(ids, ref_ids))
+        if ref_ids is None:
+            ref_ids = ids
+        results.append(Result(f"torch-{dev}", "box", **tag, build_s=b, query_s=s, counts_ok=ok))
         if brute:
-            b, s, c = run_brute_force(mins, maxs, qmins, qmaxs, dev)
+            b, s, ids = run_brute_force(mins, maxs, qmins, qmaxs, dev)
             results.append(Result(f"brute-{dev}", "box", **tag, build_s=b, query_s=s,
-                                  counts_ok=bool(np.array_equal(c, ref))))
+                                  counts_ok=bool(np.array_equal(ids, ref_ids))))
 
     if knn > 0:
         pts = qmins  # query box corners double as query points
-        s, ref_d = run_libspatialindex_knn(lsi, mins, maxs, pts, knn)
-        results.append(Result("libspatialindex", "knn", **tag, build_s=0.0, query_s=s, counts_ok=None))
+        ref_d = None
+        if lsi is not None:
+            s, ref_d = run_libspatialindex_knn(lsi, mins, maxs, pts, knn)
+            results.append(Result("libspatialindex", "knn", **tag, build_s=0.0, query_s=s, counts_ok=None))
         for dev in devices:
             s, d = run_torch_knn(mins, maxs, pts, dev, m, curve, knn)
-            results.append(Result(f"torch-{dev}", "knn", **tag, build_s=0.0, query_s=s,
-                                  counts_ok=bool(np.allclose(d, ref_d, rtol=1e-5, atol=1e-6))))
+            ok = None if ref_d is None else bool(np.allclose(d, ref_d, rtol=1e-5, atol=1e-6))
+            if ref_d is None:
+                ref_d = d
+            results.append(Result(f"torch-{dev}", "knn", **tag, build_s=0.0, query_s=s, counts_ok=ok))
     return results
 
 
 def format_table(rows: list[Result]) -> str:
-    hdr = (f"{'backend':<16}{'kind':<5}{'ndim':>5}{'N':>11}{'Q':>7}{'m':>4}{'curve':>9}{'dist':>10}"
+    hdr = (f"{'backend':<16}{'kind':<5}{'ndim':>5}{'N':>11}{'Q':>9}{'m':>4}{'curve':>9}{'dist':>10}"
            f"{'build s':>10}{'query s':>10}{'q/s':>12}{'ok':>5}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
         ok = "ref" if r.counts_ok is None else ("yes" if r.counts_ok else "NO")
         lines.append(
-            f"{r.backend:<16}{r.kind:<5}{r.ndim:>5}{r.n:>11}{r.q:>7}{r.m:>4}{r.curve:>9}{r.dist:>10}"
+            f"{r.backend:<16}{r.kind:<5}{r.ndim:>5}{r.n:>11}{r.q:>9}{r.m:>4}{r.curve:>9}{r.dist:>10}"
             f"{r.build_s:>10.4f}{r.query_s:>10.4f}{r.queries_per_s:>12.0f}{ok:>5}"
         )
     return "\n".join(lines)
@@ -283,6 +299,8 @@ def main(argv=None):
     p.add_argument("--box-size", type=float, default=0.01)
     p.add_argument("--query-size", type=float, default=0.05)
     p.add_argument("--no-brute", action="store_true", help="skip the brute-force reference")
+    p.add_argument("--no-ref", action="store_true",
+                   help="skip libspatialindex; validate other backends against the first torch backend")
     p.add_argument("--devices", nargs="+", default=None, help="torch devices (default: cpu [+ cuda])")
     p.add_argument("--csv", type=str, default=None, help="append rows to this CSV file")
     args = p.parse_args(argv)
@@ -298,7 +316,8 @@ def main(argv=None):
                         for q in args.q:
                             rows = run_config(n, q, ndim, args.box_size, args.query_size,
                                               devices=args.devices, brute=not args.no_brute,
-                                              m=m, curve=curve, dist=dist, knn=args.knn)
+                                              m=m, curve=curve, dist=dist, knn=args.knn,
+                                              ref=not args.no_ref)
                             all_rows.extend(rows)
                             print(format_table(rows), "\n", flush=True)
 
@@ -311,7 +330,7 @@ def main(argv=None):
             for r in all_rows:
                 w.writerow({**asdict(r), "queries_per_s": r.queries_per_s})
     if bad:
-        print("MISMATCH against libspatialindex:",
+        print("MISMATCH against the reference backend:",
               [(r.backend, r.kind, r.ndim, r.n) for r in bad], file=sys.stderr)
         return 1
     return 0
