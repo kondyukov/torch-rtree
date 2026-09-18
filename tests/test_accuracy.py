@@ -255,6 +255,35 @@ def test_chunk_size_is_transparent():
         tree.search(qmins, qmaxs, chunk_size=0)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_auto_batching_is_transparent(device):
+    from torchrtree.rtree import _FIRST_CHUNK
+
+    gen = torch.Generator().manual_seed(13)
+    mins, maxs = _random_boxes(20_000, 3, device, gen, size=0.02)
+    qmins, qmaxs = _random_boxes(3 * _FIRST_CHUNK, 3, device, gen, size=0.05)  # forces several batches
+    pts = torch.rand((3 * _FIRST_CHUNK, 3), generator=gen).to(device)
+
+    big = RTree(mins, maxs)                       # default budget: likely one or two batches
+    tiny = RTree(mins, maxs, pairs_budget=5_000)  # far below one batch's peak: many batches
+    assert tiny.pairs_budget == 5_000
+    single = big.search(qmins, qmaxs, chunk_size=qmins.shape[0])
+    for tree in (big, tiny):
+        res = tree.search(qmins, qmaxs)
+        assert torch.equal(res.query_idx, single.query_idx) and torch.equal(res.box_idx, single.box_idx)
+        assert torch.equal(tree.count(qmins, qmaxs), single.counts)
+        d, i = tree.nearest(pts, k=3)
+        d1, i1 = big.nearest(pts, k=3, chunk_size=pts.shape[0])
+        assert torch.equal(d, d1) and torch.equal(i, i1)
+        wd = tree.within_distance(pts, distance=0.05)
+        wd1 = big.within_distance(pts, distance=0.05, chunk_size=pts.shape[0])
+        assert torch.equal(wd.box_idx, wd1.box_idx)
+    with pytest.raises(ValueError, match="pairs_budget"):
+        RTree(mins, maxs, pairs_budget=0)
+    tiny.pairs_budget = 1  # runtime override still clamps to the minimum batch and works
+    assert torch.equal(tiny.search(qmins, qmaxs).box_idx, single.box_idx)
+
+
 def test_max_pairs_guard():
     gen = torch.Generator().manual_seed(8)
     mins, maxs = _random_boxes(3000, 2, gen=gen)

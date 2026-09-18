@@ -16,6 +16,12 @@ API reshaped around an `RTree` class and a `QueryResult` object.
 - Leaf order is now stable, so results are identical across CPU and GPU.
 - Child index tensors are no longer stored; the tree is about a third smaller. Saved-file format is 2.
 - Nearest-neighbour search rounds its search cube outward by one ulp so float rounding cannot miss a box.
+- Queries of any size are batched automatically to `tree.pairs_budget` (adaptive batch size); `nearest` batches
+  its distance and sort stage too, so 2M-query calls run in a few GB. `chunk_size` remains as a manual override.
+- `nearest` breaks distance ties by box order, so results are identical across batch sizes and devices.
+- Curve keys are computed in fixed-size row chunks at build time, so peak memory no longer grows with N.
+- Benchmarks validate exact per-query hit sets against libspatialindex; `pytest -m slow` checks 1M points.
+  Results are collected in BENCHMARKS.md.
 
 ## 0.1.0
 

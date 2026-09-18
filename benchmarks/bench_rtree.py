@@ -101,7 +101,7 @@ class Result:
     dist: str
     build_s: float
     query_s: float
-    counts_ok: bool | None  # None for the reference backend
+    counts_ok: bool | None  # exact hit sets (box) / distances (knn) match the reference; None = reference
 
     @property
     def queries_per_s(self) -> float:
@@ -131,14 +131,16 @@ def _lsi_build(mins, maxs):
     return idx, tb.seconds
 
 
-def run_libspatialindex(mins, maxs, qmins, qmaxs):
-    idx, build_s = _lsi_build(mins, maxs)
+def run_libspatialindex(idx, qmins, qmaxs):
+    """Returns (query_s, ids): ids is every query's hits, sorted, concatenated in query order."""
     qlo, qhi = qmins.astype(np.float64), qmaxs.astype(np.float64)
-    counts = np.empty(qmins.shape[0], dtype=np.int64)
+    hits = []
     with _Timer() as tq:
         for j in range(qmins.shape[0]):
-            counts[j] = len(list(idx.intersection((*qlo[j], *qhi[j]))))
-    return build_s, tq.seconds, counts
+            hits.append(list(idx.intersection((*qlo[j], *qhi[j]))))
+    sorted_hits = [np.sort(np.asarray(h, dtype=np.int64)) for h in hits]
+    ids = np.concatenate(sorted_hits) if sorted_hits else np.empty(0, np.int64)
+    return tq.seconds, ids
 
 
 def _to(device, *arrays):
@@ -154,8 +156,10 @@ def run_torch_tree(mins, maxs, qmins, qmaxs, device: str, m: int, curve: str):
     with _Timer(device) as tb:
         tree = RTree(t_mins, t_maxs, fanout=m, curve=curve)
     with _Timer(device) as tq:
-        res = tree.search(t_qmins, t_qmaxs)
-    return tb.seconds, tq.seconds, res.counts.cpu().numpy()
+        tree.search(t_qmins, t_qmaxs)
+    # Exact hit sets for validation, sorted within each query (outside the timing).
+    ids = tree.search(t_qmins, t_qmaxs, sort=True).box_idx.cpu().numpy()
+    return tb.seconds, tq.seconds, ids
 
 
 def run_brute_force(mins, maxs, qmins, qmaxs, device: str, chunk: int = 512):
@@ -167,7 +171,7 @@ def run_brute_force(mins, maxs, qmins, qmaxs, device: str, chunk: int = 512):
             hit = (t_mins.unsqueeze(0) <= qh.unsqueeze(1)).all(-1) & (
                 t_maxs.unsqueeze(0) >= ql.unsqueeze(1)
             ).all(-1)
-            out.append(hit.sum(-1))
+            out.append(torch.nonzero(hit)[:, 1])  # row-major: grouped by query, ascending box
     return 0.0, tq.seconds, torch.cat(out).cpu().numpy()
 
 
@@ -230,7 +234,8 @@ def run_config(
     tag = dict(ndim=ndim, n=n, q=q, m=m, curve=curve, dist=dist)
 
     results: list[Result] = []
-    b, s, ref = run_libspatialindex(mins, maxs, qmins, qmaxs)
+    lsi, b = _lsi_build(mins, maxs)  # built once, shared by the box and kNN references
+    s, ref = run_libspatialindex(lsi, qmins, qmaxs)
     results.append(Result("libspatialindex", "box", **tag, build_s=b, query_s=s, counts_ok=None))
 
     for dev in devices:
@@ -244,7 +249,6 @@ def run_config(
 
     if knn > 0:
         pts = qmins  # query box corners double as query points
-        lsi, _ = _lsi_build(mins, maxs)
         s, ref_d = run_libspatialindex_knn(lsi, mins, maxs, pts, knn)
         results.append(Result("libspatialindex", "knn", **tag, build_s=0.0, query_s=s, counts_ok=None))
         for dev in devices:
@@ -255,13 +259,13 @@ def run_config(
 
 
 def format_table(rows: list[Result]) -> str:
-    hdr = (f"{'backend':<16}{'kind':<5}{'ndim':>5}{'N':>9}{'Q':>7}{'m':>4}{'curve':>9}{'dist':>10}"
+    hdr = (f"{'backend':<16}{'kind':<5}{'ndim':>5}{'N':>11}{'Q':>7}{'m':>4}{'curve':>9}{'dist':>10}"
            f"{'build s':>10}{'query s':>10}{'q/s':>12}{'ok':>5}")
     lines = [hdr, "-" * len(hdr)]
     for r in rows:
         ok = "ref" if r.counts_ok is None else ("yes" if r.counts_ok else "NO")
         lines.append(
-            f"{r.backend:<16}{r.kind:<5}{r.ndim:>5}{r.n:>9}{r.q:>7}{r.m:>4}{r.curve:>9}{r.dist:>10}"
+            f"{r.backend:<16}{r.kind:<5}{r.ndim:>5}{r.n:>11}{r.q:>7}{r.m:>4}{r.curve:>9}{r.dist:>10}"
             f"{r.build_s:>10.4f}{r.query_s:>10.4f}{r.queries_per_s:>12.0f}{ok:>5}"
         )
     return "\n".join(lines)

@@ -28,7 +28,8 @@ def sfc_bits(ndim: int) -> int:
 def quantize(centers: Tensor, g_min: Tensor, g_range: Tensor, bits: int) -> Tensor:
     """Per-axis normalise to [0, 2^bits - 1] and truncate to int64."""
     max_q = (1 << bits) - 1
-    norm = ((centers - g_min) / g_range).to(torch.float64) * max_q
+    norm = ((centers - g_min) / g_range).to(torch.float64)
+    norm.mul_(max_q)  # in place: avoids a second N x ndim float64 temporary
     return norm.to(torch.int64).clamp_(0, max_q)
 
 

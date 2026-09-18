@@ -37,7 +37,8 @@ version = { attr = "torchrtree.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = '-q -m "not slow"'
+markers = ["slow: large-scale exactness checks against libspatialindex (run with: pytest -m slow)"]
 
 [tool.ruff]
 line-length = 110

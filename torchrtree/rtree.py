@@ -26,6 +26,11 @@ QueryMode = Literal["intersects", "contains", "within"]
 _MODES: tuple[str, ...] = ("intersects", "contains", "within")
 _STATE_FORMAT = 2
 
+DEFAULT_PAIRS_BUDGET = 1 << 24   # (query, node) pairs held at once by an auto-batched query
+_FIRST_CHUNK = 16_384            # queries in the first (measuring) batch
+_MIN_CHUNK = 1_024
+_KEY_CHUNK = 1 << 22             # rows per chunk when computing curve keys at build
+
 
 # -----------------------------------------------------------------------------
 # Input conversion and validation
@@ -160,18 +165,27 @@ class RTree:
 
     Inputs may be tensors, numpy arrays or lists; integer coordinates are cast
     to float64. Everything is stored detached on the input device.
+
+    Queries of any size are batched automatically: `pairs_budget` (default
+    2^24, roughly 3 GB of peak working memory) caps the number of
+    (query, node) pairs held at once, and the batch size adapts to how many
+    pairs each query produces. Set `tree.pairs_budget` lower on small GPUs.
     """
 
     __slots__ = ("mins", "maxs", "leaf_order", "level_starts", "level_fanout",
-                 "fanout", "curve", "ndim", "num_boxes", "leaf_start")
+                 "fanout", "curve", "ndim", "num_boxes", "leaf_start", "pairs_budget")
 
-    def __init__(self, mins: Any, maxs: Any | None = None, *, fanout: int = 8, curve: Curve = "hilbert"):
+    def __init__(self, mins: Any, maxs: Any | None = None, *, fanout: int = 8, curve: Curve = "hilbert",
+                 pairs_budget: int = DEFAULT_PAIRS_BUDGET):
         if fanout < 2:
             raise ValueError(f"fanout must be >= 2, got {fanout}")
         if curve not in CURVES:
             raise ValueError(f"curve must be one of {CURVES}, got {curve!r}")
+        if pairs_budget < 1:
+            raise ValueError(f"pairs_budget must be >= 1, got {pairs_budget}")
         lo, hi = _as_boxes(mins, maxs, "RTree")
         _check_values(lo, hi, "RTree", allow_inf=False)
+        self.pairs_budget = pairs_budget
         with torch.no_grad():
             self._build(lo.detach(), hi.detach(), fanout, curve)
 
@@ -181,11 +195,19 @@ class RTree:
         device, dtype = mins.device, mins.dtype
 
         # 1. Sort leaves by curve key of their centres (stable: reproducible across devices).
+        #    Keys are computed in row chunks so the float64 / int64 temporaries
+        #    of the curve never exceed a fixed size, whatever N is.
         if n > 0:
-            centers = (mins + maxs) * 0.5
             g_min = mins.amin(dim=0)
             g_range = (maxs.amax(dim=0) - g_min).clamp_min(torch.finfo(dtype).tiny)
-            order = torch.argsort(sfc_codes(centers, g_min, g_range, curve), stable=True)
+            keys = torch.empty(n, dtype=torch.int64, device=device)
+            for s in range(0, n, _KEY_CHUNK):
+                e = min(n, s + _KEY_CHUNK)
+                centers = (mins[s:e] + maxs[s:e]) * 0.5
+                keys[s:e] = sfc_codes(centers, g_min, g_range, curve)
+            del centers
+            order = torch.argsort(keys, stable=True)
+            del keys
         else:
             order = torch.empty(0, dtype=torch.int64, device=device)
 
@@ -347,8 +369,9 @@ class RTree:
                      "contains"   (indexed box lies entirely inside the query),
                      "within"     (indexed box entirely contains the query).
         sort:        sort box indices ascending within each query (default: tree order).
-        chunk_size:  process at most this many queries at once to bound memory.
-        max_pairs:   raise if any level's frontier exceeds this many pairs.
+        chunk_size:  fixed number of queries per batch; None (default) adapts the
+                     batch size to `tree.pairs_budget`.
+        max_pairs:   raise if any batch's frontier exceeds this many pairs.
         validate:    check for NaN and min <= max (each check is a device sync).
         """
         if mode not in _MODES:
@@ -465,39 +488,62 @@ class RTree:
 
         root_node = torch.zeros(Q, dtype=torch.int64, device=device)
         r = (_box_distance(self, root_node, lo_all, hi_all, scale) * 1.001).clamp_min(r0).clamp_max(cap)
-        pending = torch.arange(Q, device=device)
 
-        while pending.numel() > 0:
-            lo, hi = lo_all[pending], hi_all[pending]
-            rad = (r[pending].unsqueeze(1) / scale)
+        def knn_round(sub: Tensor) -> Tensor:
+            """One search round for the queries in `sub`: returns (unfinished queries, pairs examined)."""
+            lo, hi = lo_all[sub], hi_all[sub]
+            rad = (r[sub].unsqueeze(1) / scale)
             q, node = _run_frontier(self, _step_down(lo - rad), _step_up(hi + rad), "intersects",
                                     chunk_size, max_pairs)
             d = _box_distance(self, node, lo[q], hi[q], scale)
 
-            # Order pairs by (query, distance): sort by distance, then stable sort by query.
-            d, perm = torch.sort(d)
+            # Order pairs by (query, distance, node) with stable sorts from the
+            # least significant key up, so ties resolve identically whatever
+            # the batch composition or device.
+            perm = torch.argsort(node)
+            q, node, d = q[perm], node[perm], d[perm]
+            d, perm = torch.sort(d, stable=True)
             q, node = q[perm], node[perm]
             q, perm = torch.sort(q, stable=True)
             d, node = d[perm], node[perm]
 
-            counts = torch.bincount(q, minlength=pending.numel())
+            counts = torch.bincount(q, minlength=sub.numel())
             pos = torch.arange(q.numel(), device=device) - (counts.cumsum(0) - counts)[q]
             has_k = counts >= k_eff
-            kth = torch.full((pending.numel(),), float("inf"), dtype=dtype, device=device)
+            kth = torch.full((sub.numel(),), float("inf"), dtype=dtype, device=device)
             sel = pos == (k_eff - 1)
             kth[q[sel]] = d[sel]
-            r_cur = r[pending]
+            r_cur = r[sub]
             done = (has_k & (kth <= r_cur)) | (r_cur >= cap)
 
             keep = done[q] & (pos < k_eff)
             if max_distance is not None:
                 keep &= d <= max_distance
-            idx_out[pending[q[keep]], pos[keep]] = self.leaf_order[node[keep] - self.leaf_start]
-            dist_out[pending[q[keep]], pos[keep]] = d[keep]
+            idx_out[sub[q[keep]], pos[keep]] = self.leaf_order[node[keep] - self.leaf_start]
+            dist_out[sub[q[keep]], pos[keep]] = d[keep]
 
             r_next = torch.where(has_k, kth * (1 + 1e-6), r_cur * 2).clamp_max(cap)
-            r[pending] = torch.where(done, r_cur, r_next)
-            pending = pending[~done]
+            r[sub] = torch.where(done, r_cur, r_next)
+            return sub[~done], q.numel()
+
+        # Each round runs in query batches sized to pairs_budget, since the
+        # distance / sort stage holds every candidate pair of a batch at once.
+        pending = torch.arange(Q, device=device)
+        while pending.numel() > 0:
+            still, s, per_query = [], 0, 0.0
+            while s < pending.numel():
+                if chunk_size is not None:
+                    n = chunk_size
+                elif per_query == 0.0:
+                    n = _FIRST_CHUNK
+                else:
+                    n = max(_MIN_CHUNK, int(self.pairs_budget / per_query))
+                sub = pending[s:s + n]
+                unfinished, pairs = knn_round(sub)
+                per_query = max(per_query, pairs / sub.numel())
+                still.append(unfinished)
+                s += sub.numel()
+            pending = torch.cat(still) if len(still) > 1 else still[0]
         return dist_out, idx_out
 
     def self_join(self, *, mode: QueryMode = "intersects", sort: bool = False,
@@ -544,16 +590,19 @@ def _node_test(tree: RTree, node: Tensor, qmins: Tensor, qmaxs: Tensor, q: Tenso
 
 
 def _frontier(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
-              max_pairs: int | None) -> tuple[Tensor, Tensor]:
-    """Core traversal. Returns (query_idx, node_idx) with node_idx in tree space."""
+              max_pairs: int | None) -> tuple[Tensor, Tensor, int]:
+    """
+    Core traversal. Returns (query_idx, node_idx, peak) with node_idx in tree
+    space and peak the largest frontier (in pairs) reached at any level.
+    """
     Q, device = qmins.shape[0], tree.device
     if Q == 0 or tree.num_boxes == 0:
         e = torch.empty(0, dtype=torch.int64, device=device)
-        return e, e.clone()
+        return e, e.clone(), Q
 
     fq = torch.arange(Q, device=device)
     fn = torch.zeros(Q, dtype=torch.int64, device=device)  # root
-    ls = tree.level_starts
+    ls, peak = tree.level_starts, Q
     for level, cpn in enumerate(tree.level_fanout):  # internal levels, top-down
         hit = _node_test(tree, fn, qmins, qmaxs, fq, mode, leaf=False)
         fq, fn = fq[hit], fn[hit]
@@ -562,27 +611,46 @@ def _frontier(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
         valid = child < ls[level + 2]                                     # last node may be short
         fq = fq.unsqueeze(1).expand_as(child)[valid]
         fn = child[valid]
+        peak = max(peak, fn.numel())
         if max_pairs is not None and fn.numel() > max_pairs:
             raise RuntimeError(
                 f"query frontier reached {fn.numel()} (query, node) pairs, above max_pairs={max_pairs}; "
                 f"pass a larger max_pairs, a chunk_size, or narrow the queries")
 
     hit = _node_test(tree, fn, qmins, qmaxs, fq, mode, leaf=True)
-    return fq[hit], fn[hit]
+    return fq[hit], fn[hit], peak
 
 
 def _run_frontier(tree: RTree, qmins: Tensor, qmaxs: Tensor, mode: str,
                   chunk_size: int | None, max_pairs: int | None) -> tuple[Tensor, Tensor]:
+    """
+    Traverse in batches of queries. With chunk_size=None the batch size adapts:
+    a first batch of _FIRST_CHUNK queries measures the peak pairs per query,
+    and every later batch is sized so its expected peak fits tree.pairs_budget.
+    A fixed chunk_size is used as given.
+    """
     Q = qmins.shape[0]
-    if chunk_size is None or chunk_size >= Q:
-        return _frontier(tree, qmins, qmaxs, mode, max_pairs)
-    if chunk_size <= 0:
+    if chunk_size is not None and chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     qs, ns = [], []
-    for s in range(0, Q, chunk_size):
-        fq, fn = _frontier(tree, qmins[s:s + chunk_size], qmaxs[s:s + chunk_size], mode, max_pairs)
+    s, per_query = 0, 0.0
+    while s < Q or s == 0:
+        if chunk_size is not None:
+            n = chunk_size
+        elif per_query == 0.0:
+            n = _FIRST_CHUNK
+        else:
+            n = max(_MIN_CHUNK, int(tree.pairs_budget / per_query))
+        e = min(Q, s + n)
+        fq, fn, peak = _frontier(tree, qmins[s:e], qmaxs[s:e], mode, max_pairs)
+        per_query = max(per_query, peak / max(e - s, 1))
         qs.append(fq + s)
         ns.append(fn)
+        s = e
+        if Q == 0:
+            break
+    if len(qs) == 1:
+        return qs[0], ns[0]
     return torch.cat(qs), torch.cat(ns)
 
 

@@ -53,9 +53,9 @@ tree.cuda(); tree.save("tree.pt"); RTree.load("tree.pt")
 | `tree.boxes()`, `tree.bounds`, `len(tree)` | indexed boxes in input order, root box, box count |
 | `tree.to(dev)`, `.cpu()`, `.cuda()`, `.save(p)`, `RTree.load(p)` | device moves and persistence |
 
-Every query method also takes `chunk_size` (bound memory by batching queries), `max_pairs` (raise instead of
-allocating an oversized frontier) and `validate=False` (skip the NaN and min ≤ max checks, which each cost a
-device sync). `build_rtree(mins, maxs, ...)` is a functional alias for the constructor.
+Every query method also takes `chunk_size` (a fixed batch size instead of the automatic one), `max_pairs` (raise
+instead of allocating an oversized frontier) and `validate=False` (skip the NaN and min ≤ max checks, which each
+cost a device sync). `build_rtree(mins, maxs, ...)` is a functional alias for the constructor.
 
 **Semantics worth knowing**
 
@@ -72,40 +72,13 @@ device sync). `build_rtree(mins, maxs, ...)` is a functional alias for the const
 
 ## Performance
 
-1M boxes, 10k queries, fan-out 8, Hilbert ordering, uniform data with a 1000x wider last axis. AMD Radeon RX 7900 XT
-(ROCm), torch 2.9. The libspatialindex column is the `rtree` package driven one query at a time from Python. All torch
-rows return exactly libspatialindex's hit sets.
+On an AMD Radeon RX 7900 XT, 1M boxes bulk-load in 15 ms and a 10k-query batch answers at roughly 2M box
+queries per second in 3D, about 80x libspatialindex driven from Python. Per-query cost stays flat from 1M to 100M
+points. Full tables, including CPU numbers, 10M and 100M scaling, k-nearest, fan-out and curve sweeps, are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
-Box intersection queries per second:
-
-| ndim | libspatialindex | torch CPU | torch GPU |
-|---|---|---|---|
-| 2 | 7,100 | 62,600 | 719,000 |
-| 3 | 25,300 | 409,000 | 1,970,000 |
-| 4 | 25,100 | 628,000 | 1,710,000 |
-
-k-nearest (k = 5) queries per second:
-
-| ndim | libspatialindex | torch CPU | torch GPU |
-|---|---|---|---|
-| 2 | 25,100 | 15,900 | 566,000 |
-| 3 | 16,100 | 28,000 | 472,000 |
-| 4 | 3,200 | 26,300 | 208,000 |
-
-Build time for 1M boxes: libspatialindex 2.6 to 3.3 s; torch CPU 0.14 s; torch GPU 0.015 s.
-
-The 2D rows are output-bound: each 2D query returns thousands of hits at this box density.
-
-**Tuning.** Fan-out 8 was fastest on both devices; 16 and 32 were slower to query in every configuration.
-Hilbert ordering queries 20 to 50 percent faster than Morton and builds about 1.6x slower; pass `curve="morton"` when
-build time dominates. Small query batches favour the CPU; the GPU pulls ahead from a few thousand queries per call.
-
-Reproduce with:
-
-```bash
-python -m benchmarks.bench_rtree --n 1000000 --q 10000 --ndim 2 3 4 --knn 5
-python -m benchmarks.bench_rtree --m 8 16 32 --curve morton hilbert --dist clustered
-```
+Queries of any size are batched automatically to a memory budget (`tree.pairs_budget`), so a single call can carry
+millions of queries without a wrapper.
 
 ## How it works
 
