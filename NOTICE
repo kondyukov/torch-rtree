@@ -1,6 +1,7 @@
 torchrtree
 Copyright 2026 Grigoriy Kondyukov
 
-This product includes software developed by Grigoriy Kondyukov.
+This product includes software developed by Grigoriy Kondyukov
+(https://github.com/kondyukov/torch-rtree).
 
 Licensed under the Apache License, Version 2.0. See LICENSE for the full text.

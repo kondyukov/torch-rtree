@@ -17,6 +17,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
 ]
 
+[project.urls]
+Homepage = "https://github.com/kondyukov/torch-rtree"
+Changelog = "https://github.com/kondyukov/torch-rtree/blob/main/CHANGELOG.md"
+Issues = "https://github.com/kondyukov/torch-rtree/issues"
+
 [project.optional-dependencies]
 bench = ["numpy>=1.24", "rtree>=1.0"]
 dev = ["pytest>=7", "ruff>=0.5", "numpy>=1.24", "rtree>=1.0"]
